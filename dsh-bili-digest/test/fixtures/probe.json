@@ -1,0 +1,17 @@
+{
+  "id": "BV1GJ411x7h7",
+  "title": "【官方 MV】Never Gonna Give You Up - Rick Astley",
+  "duration": 212.393,
+  "uploader": "索尼音乐中国",
+  "webpage_url": "https://www.bilibili.com/video/BV1GJ411x7h7",
+  "description": "-",
+  "tags": [],
+  "chapters": null,
+  "subtitles": {},
+  "extractor": "BiliBili",
+  "formats": [
+    { "format_id": "30216", "ext": "m4a", "acodec": "mp4a.40.5", "vcodec": "none", "abr": 43.962 },
+    { "format_id": "30232", "ext": "m4a", "acodec": "mp4a.40.2", "vcodec": "none", "abr": 102.931 },
+    { "format_id": "30280", "ext": "m4a", "acodec": "mp4a.40.2", "vcodec": "none", "abr": 203.786 }
+  ]
+}
