@@ -22,7 +22,7 @@
 - 时间单位统一用**秒**（浮点）；只有配置文件里写成 `windowSeconds` 这类带单位后缀的名字。
 - Segment 形状固定为 `{ start: number, end: number, text: string }`（秒）。
 - 所有文件写入走「临时文件 + rename」。
-- 测试用 `node --test`，断言用 `node:assert/strict`。
+- 测试用 `node --test`，断言用 `node:assert/strict`。**`test/fixtures/` 只放数据文件（`.json`/`.txt`），绝不放 `.js`/`.mjs`**：无参数的 `node --test` 会递归执行 `test/` 下所有 `.js`/`.cjs`/`.mjs`，夹具模块会被当成测试文件跑。
 - 每个任务结束时必须：`node --test` 全绿 → `git commit`。
   **不要写 `node --test test/`**：Node ≥22 把路径参数当 glob，目录会被当成测试文件执行，结果是 0 pass / 1 fail（本机 v24.18.0 实测）。用无参数的 `node --test`（它自己会发现 `test/**/*.test.mjs`）。
 - 平台目标为 Windows x64；路径一律用 `node:path` 拼接。
@@ -613,6 +613,7 @@ git commit -m "feat(bili-digest): 缓存路径与原子读写"
 **Files:**
 - Create: `src/jobs.js`
 - Create: `test/jobs.test.mjs`
+- Modify: `test/json.test.mjs`（追加 F21 守门用例——作业记录格式由本任务产出，所以这条断言只能在这里落地）
 
 **Interfaces:**
 - Consumes: `writeJsonAtomic` / `readJson`（Task 3）、`compact`（Task 1）
@@ -748,13 +749,59 @@ test('load() 读回磁盘上的全部作业', async () => {
   assert.equal(reg2.list()[0].id, job.id)
   await rm(dir, { recursive: true, force: true })
 })
+
+test('options 与 result 里的 undefined 在落盘前就被剥掉', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'jobs-'))
+  const reg = new Registry(dir)
+  const job = await reg.start({ url: 'u', options: { keep: 1, drop: undefined }, run: async () => ({ ok: 1, missing: undefined }) })
+  await reg.wait(job.id, 5)
+  await reg.dispose()
+  const raw = JSON.parse(await readFile(join(dir, 'jobs', job.id, 'job.json'), 'utf8'))
+  assert.equal(raw.options.keep, 1)
+  assert.equal('drop' in raw.options, false)
+  assert.equal('missing' in raw.result, false)
+  await rm(dir, { recursive: true, force: true })
+})
 ```
+
+`test/json.test.mjs`（**追加**，不要重写已有用例）——在文件顶部补一行 import，并在末尾加这条 F21 守门用例：
+
+```js
+import { readFile } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+test('真实作业记录过 compact 后是无损 JSON（F21 守门用例）', async () => {
+  // 这条必须跑**磁盘上的真实作业记录**，而不是合成的对象：
+  // 宿主的无损 JSON 校验发生在运行时出口，合成对象覆盖不到
+  // 「落盘记录里某个字段是 undefined」这个唯一的真实失败路径。
+  const dir = await mkdtemp(join(tmpdir(), 'json-'))
+  const { Registry } = await import('../src/jobs.js')
+  const reg = new Registry(dir)
+  const job = await reg.start({
+    url: 'u',
+    options: { keep: 1, drop: undefined },
+    run: async () => ({ ok: 1, nested: { gone: undefined } }),
+  })
+  await reg.wait(job.id, 5)
+  await reg.dispose()
+
+  const raw = JSON.parse(await readFile(join(dir, 'jobs', job.id, 'job.json'), 'utf8'))
+  const text = JSON.stringify(compact(raw))
+  assert.ok(!text.includes('undefined'), `序列化结果里不应出现 undefined：${text}`)
+  assert.equal(JSON.parse(text).result.ok, 1)
+  assert.equal('gone' in JSON.parse(text).result.nested, false)
+  await rm(dir, { recursive: true, force: true })
+})
+```
+
+> 说明：这条断言按 design §12.1 归在 `test/json.test.mjs`，但它依赖作业记录的格式，所以只能在产出该格式的任务（本任务）里落地——Task 1 写不了，提前自造 fixture 比缺失更糟。
 
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `node --test test/jobs.test.mjs`
 Expected: FAIL —— 模块不存在
-
 - [ ] **Step 3: 写最小实现**
 
 `src/jobs.js`：
@@ -929,8 +976,8 @@ export class Registry {
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `node --test test/jobs.test.mjs`
-Expected: PASS
+Run: `node --test`
+Expected: PASS，jobs 与 json 两个文件全绿（本任务同时改了 `test/json.test.mjs`，所以跑全量）
 
 - [ ] **Step 5: 提交**
 
