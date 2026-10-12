@@ -1110,8 +1110,12 @@ test('裸 BV 号归一化为视频页 URL', () => {
   assert.equal(r.page, 1)
 })
 
-test('BV 号大小写归一化', () => {
-  assert.equal(normalizeUrl('bv1gj411x7h7').bvid, 'BV1GJ411x7h7')
+test('BV 号只规整前缀大小写，body 原样保留', () => {
+  // body 大小写敏感，实测 bv1gj411x7h7 会解析成另一个真实视频，
+  // BV1GJ411X7H7 则让 yt-dlp 报 KeyError('bvid')。改了 body 就是改视频。
+  assert.equal(normalizeUrl('bv1gj411x7h7').bvid, 'BV1gj411x7h7')
+  assert.equal(normalizeUrl('BV1GJ411x7h7').bvid, 'BV1GJ411x7h7')
+  assert.equal(normalizeUrl('Bv1GJ411x7h7').bvid, 'BV1GJ411x7h7')
 })
 
 test('完整 URL 透传并抽出分P', () => {
@@ -1173,7 +1177,6 @@ Expected: FAIL —— 模块不存在
 ```js
 import { BiliDigestError } from '../errors.js'
 
-const BV_RE = /^BV[0-9A-Za-z]{10}$/
 const AV_RE = /^av(\d+)$/i
 const ALLOWED_HOSTS = ['bilibili.com', 'b23.tv', 'bilibili.tv']
 
@@ -1210,9 +1213,17 @@ export function normalizeUrl(raw) {
     throw new BiliDigestError('BAD_INPUT', '没有给出视频地址', '用法：/bilisum <BV号|链接>')
   }
 
-  // 裸 BV 号
-  const bv = BV_RE.test(text) ? text : BV_RE.test(text.toUpperCase()) ? text.toUpperCase() : null
-  if (bv) {
+  // 裸 BV 号。**只规整 `BV` 前缀，body 一个字都不许动。**
+  //
+  // BV 的 body 是大小写敏感的 base58，实测三个变体三条命：
+  //   BV1GJ411x7h7  → 正确视频
+  //   bv1gj411x7h7  → 解析成**另一个真实存在的视频**（静默指错）
+  //   BV1GJ411X7H7  → yt-dlp 直接 KeyError('bvid')
+  // 所以任何"顺手把大小写统一一下"的规整都是错的：它要么让请求失败，
+  // 要么更糟——把用户悄悄指向别人的视频。只把前缀规整成站点自己也在用的 `BV`。
+  const bvMatch = /^([Bb][Vv])([0-9A-Za-z]{10})$/.exec(text)
+  if (bvMatch) {
+    const bv = `BV${bvMatch[2]}`
     return { url: `https://www.bilibili.com/video/${bv}`, bvid: bv, page: 1 }
   }
 
