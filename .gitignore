@@ -1,0 +1,10 @@
+# 调查临时区（asar 抽取、抓包脚本），不纳入版本控制
+.scratch/
+
+# 依赖与构建产物
+node_modules/
+dist/
+*.log
+
+# 插件运行产物
+bili-digest/
