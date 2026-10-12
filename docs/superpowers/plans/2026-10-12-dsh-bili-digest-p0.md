@@ -813,6 +813,7 @@ test('作业状态落盘，新 Registry 实例可读回', async () => {
   await reg.wait(job.id, 5)
   await reg.dispose()
   const reg2 = new Registry(dir)
+  await reg2.load()
   assert.deepEqual(reg2.get(job.id).result, { v: 7 })
   await rm(dir, { recursive: true, force: true })
 })
@@ -853,9 +854,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 test('真实作业记录过 compact 后是无损 JSON（F21 守门用例）', async () => {
-  // 这条必须跑**磁盘上的真实作业记录**，而不是合成的对象：
-  // 宿主的无损 JSON 校验发生在运行时出口，合成对象覆盖不到
-  // 「落盘记录里某个字段是 undefined」这个唯一的真实失败路径。
+  // 关键：断言必须看**属性是否存在**，不能只看 JSON.stringify 出来的文本。
+  // JSON.stringify 本来就会丢掉值为 undefined 的键，所以「序列化结果里没有
+  // undefined」这类断言永远成立——它抓不到 compact() 被整个删掉。
+  // 真正的暴露面是内存里那个会被直接交给宿主运行时校验的快照对象。
   const dir = await mkdtemp(join(tmpdir(), 'json-'))
   const { Registry } = await import('../src/jobs.js')
   const reg = new Registry(dir)
@@ -864,14 +866,19 @@ test('真实作业记录过 compact 后是无损 JSON（F21 守门用例）', as
     options: { keep: 1, drop: undefined },
     run: async () => ({ ok: 1, nested: { gone: undefined } }),
   })
-  await reg.wait(job.id, 5)
+  const snap = await reg.wait(job.id, 5)
   await reg.dispose()
 
+  // 1) 内存快照——宿主真正校验的那个对象
+  assert.equal('drop' in snap.options, false, 'options 里的 undefined 键必须已被剥离')
+  assert.equal('gone' in snap.result.nested, false, 'result 里嵌套的 undefined 键必须已被剥离')
+  assert.equal(snap.options.keep, 1)
+
+  // 2) 磁盘记录——持久化路径同样要干净
   const raw = JSON.parse(await readFile(join(dir, 'jobs', job.id, 'job.json'), 'utf8'))
-  const text = JSON.stringify(compact(raw))
-  assert.ok(!text.includes('undefined'), `序列化结果里不应出现 undefined：${text}`)
-  assert.equal(JSON.parse(text).result.ok, 1)
-  assert.equal('gone' in JSON.parse(text).result.nested, false)
+  assert.equal('drop' in raw.options, false)
+  assert.equal('gone' in raw.result.nested, false)
+  assert.equal(raw.result.ok, 1)
   await rm(dir, { recursive: true, force: true })
 })
 ```
@@ -915,6 +922,13 @@ export class Registry {
   #controller = null
   #disposed = false
 
+  /**
+   * @param root cacheDir
+   * @param logger 可为 undefined
+   *
+   * **构造函数绝不做任何 I/O。** 插件挂载跑在 DSH 的事件循环上，在这里同步扫盘
+   * 会让挂载耗时随历史作业数增长。读盘是显式的 `await load()`，由调用方决定时机。
+   */
   constructor(root, logger) {
     this.#root = root
     this.#logger = logger
