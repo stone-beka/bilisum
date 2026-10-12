@@ -11,7 +11,7 @@
   },
   "files": ["index.js", "src", "cordis.patch.yml", "THIRD_PARTY_NOTICES.md"],
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test",
     "check": "node --check index.js"
   },
   "engines": { "node": ">=20" },
