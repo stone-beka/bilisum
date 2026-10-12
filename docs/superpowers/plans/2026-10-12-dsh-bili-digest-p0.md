@@ -23,7 +23,8 @@
 - Segment 形状固定为 `{ start: number, end: number, text: string }`（秒）。
 - 所有文件写入走「临时文件 + rename」。
 - 测试用 `node --test`，断言用 `node:assert/strict`。
-- 每个任务结束时必须：`node --test test/` 全绿 → `git commit`。
+- 每个任务结束时必须：`node --test` 全绿 → `git commit`。
+  **不要写 `node --test test/`**：Node ≥22 把路径参数当 glob，目录会被当成测试文件执行，结果是 0 pass / 1 fail（本机 v24.18.0 实测）。用无参数的 `node --test`（它自己会发现 `test/**/*.test.mjs`）。
 - 平台目标为 Windows x64；路径一律用 `node:path` 拼接。
 - **不实现**（P0 范围外）：字幕通路、UP 主章节对照、L2 证据源、缓存 LRU、map-reduce。
 
@@ -100,7 +101,7 @@ dsh-bili-digest/
   },
   "files": ["index.js", "src", "cordis.patch.yml", "THIRD_PARTY_NOTICES.md"],
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test",
     "check": "node --check index.js"
   },
   "engines": { "node": ">=20" },
@@ -4703,7 +4704,7 @@ export function apply(ctx, config = {}) {
 
 - [ ] **Step 4: 跑全量测试确认通过并提交**
 
-Run: `node --test test/`
+Run: `node --test`
 Expected: 全部 PASS
 
 ```bash
@@ -4820,7 +4821,7 @@ git commit -m "docs: P0 端到端验收记录"
 
 P0 完成的判据（全部满足才算完）：
 
-1. `node --test test/` 全绿。
+1. `node --test` 全绿。
 2. `/bilisum BV1GJ411x7h7` 在真实 DSH 里产出 Markdown 文件。
 3. 产物满足 Task 21 Step 3 的全部检查项。
 4. `/bilisum status` 与 `/bilisum list` 可用，作业落盘可查。
