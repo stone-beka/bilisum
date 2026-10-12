@@ -68,6 +68,13 @@
 | F22 | 长任务会撞工具超时策略 | 同类项目结论：16 分钟音频转写要 3~6 分钟，`tool-call-timeout-policy` 会按工具装 `exec.signal` 截止时间 |
 | F23 | 桌面版 `desktop` profile 由应用独占管理 | 同类项目结论：`dsh plugin --profile desktop` 会被 CLI 显式拒绝；改 profile `package.json` 有效，但需**重启桌面版** |
 | F24 | HMR 需 profile 显式配 `base` / `root` | 同类项目结论：没配则整个进程缓存 Host 模块，改 `index.js` 不生效 |
+| F25 | **本机开着系统代理，且它是 B 站 412 的直接原因** | Spike 实测：`ProxyEnable=1`、`ProxyServer=127.0.0.1:7890`。`api.bilibili.com` **直连 200 / 走代理 412**；`github.com` release 资产 **直连 000 / 走代理 302**；`ghproxy.net` 两边都 200。→ 必须**分目标控制代理** |
+| F26 | **`yt-dlp.exe` 子进程必须显式设 `TEMP`/`TMP`/`TMPDIR`** | Spike 实测：默认 temp 下报 `[PYI-25504:ERROR] Could not create temporary directory!`；指向自定义可写目录后正常。PyInstaller onefile 需要在 temp 里解包并加载 DLL |
+| F27 | **`yt-dlp` 本身不绕过风控，风控是出口 IP 层面的** | Spike 实测：`--impersonate chrome`、`--user-agent`、`--force-ipv4`、`--cookies` 单独都救不了；只有把代理改直连才对。v1 规格里"换 yt-dlp 就绕开风控"的说法**不成立**，已修正 |
+| F28 | `yt-dlp.exe` 可从镜像取得并校验 | Spike 实测：GitHub release 直连不通，`ghproxy.net` 200；下载 17,840,399 B，SHA256 与官方 `SHA2-256SUMS` 一致 |
+| F29 | yt-dlp probe 在本机实测可用 | Spike 实测：`--dump-single-json --skip-download` 返回 `extractor=BiliBili / title / duration=212.393 / uploader / formats=15`；音轨 `30216`(44k HE-AAC)、`30232`(103k AAC-LC)、`30280`(204k AAC-LC) |
+| F30 | yt-dlp 下载的音频是 fMP4 + AAC | Spike 实测：`-f 30232` 得 2.61 MB，文件头 `ftyp iso5 … avc1 iso5 dsms msix dash` —— 与 F4 一致，是 ffmpeg 的合法输入 |
+| F31 | 匿名下 yt-dlp 的 `subtitles` 为空 | Spike 实测：`subtitles=[]`、`automatic_captions=[]` —— 与 F2 完全一致，且 yt-dlp 源码在 `need_login_subtitle` 时会自己告警 |
 
 ---
 
@@ -76,7 +83,7 @@
 | 决策点 | 结论 | 理由 |
 |---|---|---|
 | 交付形态 | DSH 插件，Host 单半身，**注册命令**（非工具） | 用户选择；命令是用户驱动，不被工具的截止时间策略约束 |
-| 取数层 | **`yt-dlp`**（音频 + 字幕 + 元信息 + UGC 章节） | 用户选择路线 A。绕开 F1 风控、WBI 签名、DASH 选轨、cookie 兼容等全部自写成本 |
+| 取数层 | **`yt-dlp`**（音频 + 字幕 + 元信息 + UGC 章节） | 用户选择路线 A。省掉 WBI 签名、DASH 选轨、cookie 兼容、抗封禁跟版等自写成本。**但注意：它不消除风控**（F27）——风控在出口 IP 层，yt-dlp 也绕不开，仍需代理策略（F25） |
 | 转写路线 | 字幕优先 → 本地识别兜底，**显式回退** | 用户选择；字幕零成本且句级精确 |
 | 本地 ASR 通道 | `ctx.speechToText`（不 import 包，走 `ctx.get`） | 复用 DSH 已托管的 provider 与模型下载逻辑，不引入第 4 个二进制 |
 | 音频解码 | 静态 ffmpeg（`@ffmpeg-installer/win32-x64`） | 用户选择；封在单一模块内可替换 |
@@ -225,20 +232,48 @@ export class Registry {
 
 ### 5.4 `src/media/tools.js`
 
-**职责**：定位并自检外部可执行文件。**缺什么就说什么，不说清楚比没有更糟。**
+**职责**：定位、自检、必要时下载外部可执行文件，并为它们构造**正确的子进程运行环境**。**缺什么就说什么，不说清楚比没有更糟。**
 
 ```js
 export function resolveYtDlp(config)   // → 绝对路径 | undefined
 export function resolveFfmpeg(config)  // → 绝对路径 | undefined
 export function checkTools(config)     // → { ytDlp?: problem, ffmpeg?: problem }
 export async function ensureYtDlp(config, onProgress, signal)
+/** 构造子进程 env：补齐 TEMP/TMP/TMPDIR 并清掉不该继承的代理变量。 */
+export function childEnv(config, target): NodeJS.ProcessEnv
 ```
 
-解析顺序：
+分辨率顺序：
 
-- **yt-dlp**：`config.ytDlpPath` → `<cacheDir>/bin/yt-dlp.exe` → 自动下载（GitHub `yt-dlp/yt-dlp` latest，资产 `yt-dlp.exe`，17.0 MB，校验 `SHA2-256SUMS`）
+- **yt-dlp**：`config.ytDlpPath` → `<cacheDir>/bin/yt-dlp.exe` → 自动下载
 - **ffmpeg**：`config.ffmpegPath` → `<cacheDir>/bin/ffmpeg.exe` → 已安装依赖 `@ffmpeg-installer/win32-x64`
-- `--update-tools` 强制重新下载 yt-dlp（B 站接口常变，yt-dlp 需要跟版）
+
+**下载镜像链（F28 测过）**：按序尝试
+
+1. `https://ghproxy.net/https://github.com/yt-dlp/yt-dlp/releases/download/<tag>/yt-dlp.exe`
+2. `https://gh-proxy.com/https://github.com/...`
+3. `https://github.com/yt-dlp/yt-dlp/releases/download/<tag>/yt-dlp.exe`（本机直连不通，放最后）
+
+下载后必须与同 tag 的 `SHA2-256SUMS` 比对 SHA-256，**校验不过就丢弃并换下一个镜像**。
+
+**子进程环境（F26 + F25，两条都是实测踩出来的）**：
+
+```js
+// childEnv 的两条职责
+1. TEMP / TMP / TMPDIR 必须显式指向一个我们自己保证可写的目录
+   （默认 <cacheDir>/tmp），否则 PyInstaller 打包的 yt-dlp.exe 直接起不来：
+   [PYI-xxxxx:ERROR] Could not create temporary directory!
+2. 代理必须显式化，绝不能靠继承：
+   - target === 'bilibili'  → 默认强制直连（config.proxy 为 'system' 时除外）
+   - target === 'tool-download' → 用 config.toolProxy（默认跟随系统代理，因为
+     GitHub release 资产在本机直连不通、走代理才通）
+   实现上：对 yt-dlp 传 --proxy=<值>（直连时传空串），并同时设置/清除
+   HTTP_PROXY / HTTPS_PROXY / NO_PROXY，双保险
+```
+
+代理策略是**分目标**的，因为实测（F25）这台机器上 B 站与 GitHub 的连通性要求正好相反。写死任一侧都会导致一侧不可用。
+
+`--update-tools` 强制重新下载 yt-dlp（B 站接口常变，yt-dlp 需跟版）。
 
 两个文件都缺时插件**仍然注册命令**，调用时返回结构化错误码与放置路径指引。
 
@@ -271,16 +306,20 @@ export async function downloadAudio(cfg, url, destPath, { cookieFile, signal, on
 export async function version(cfg, signal): Promise<string>
 ```
 
-命令行：
+命令行（`<p>` = 由 `childEnv(config,'bilibili')` 决定的代理，默认空 = 直连）：
 
 ```
 probe:      yt-dlp --dump-single-json --skip-download --no-warnings --no-playlist
-                   [--cookies <file>] <url>
+                   --proxy=<p> [--cookies <file>] <url>
 subtitle:   yt-dlp --skip-download --write-subs --sub-langs <lang> --sub-format srt
-                   --no-warnings -o <dir>/sub [--cookies <file>] <url>
-audio:      yt-dlp -f bestaudio/best --no-playlist --no-warnings
+                   --no-warnings --proxy=<p> -o <dir>/sub [--cookies <file>] <url>
+audio:      yt-dlp -f <选择> --no-playlist --no-warnings --proxy=<p>
                    -o <dest> [--cookies <file>] <url>
 ```
+
+音轨选择由 `config.audioQuality` 决定：`balanced`（默认）→ `30232`；`smallest` → `30216`；`best` → `30280`。指定 format_id 不可用时回落 `bestaudio/best`。
+
+每个子进程都必须带 `childEnv(config,'bilibili')`（F25/F26）。**不给 `--proxy` 就等于让它继承系统代理，在装有 Clash 类工具的机器上会直接 412。**
 
 `ProbeInfo` 归约后只保留：
 
@@ -604,6 +643,9 @@ ctx.commands.register({
 | `minSegmentSeconds` | `5` | 尾片合并阈值 |
 | `ytDlpPath` | `''` | 空 = 自动定位/下载 |
 | `ffmpegPath` | `''` | 空 = 自动定位 |
+| `audioQuality` | `balanced` | `balanced`(30232) / `smallest`(30216) / `best`(30280) |
+| `proxy` | `''` | **访问 B 站时的代理**。`''` = 强制直连（默认，F25 实测必需）；`'system'` = 跟随系统代理；其它 = 代理 URL |
+| `toolDownloadProxy` | `'system'` | **下载 yt-dlp 时的代理**。`'system'` = 跟随系统（F25 实测 GitHub release 直连不通）；`''` = 直连；其它 = 代理 URL |
 | `sttProvider` | `''` | 空 = `speechToText` 当前选择 |
 | `summaryModel` | `{ provider: '', model: '' }` | 空 = 继承 agent 默认 |
 | `waitSeconds` | `45` | `start` 当场等待秒数；0–120 |
@@ -737,6 +779,9 @@ ctx.commands.register({
 | `UNSUPPORTED_URL` | 非 B 站 / 非 http(s) | 说明仅支持 B 站 |
 | `YTDLP_MISSING` | 三个解析路径都失败 | 给出放置路径与 `--update-tools` |
 | `YTDLP_FAILED` | yt-dlp 非零退出 | 附 stderr 尾部与结构化原因 |
+| `YTDLP_BLOCKED` | stderr 含 `HTTP Error 412` | 指出很可能是代理出口被 B 站拦截，建议把 `proxy` 设为 `''`（F25/F27） |
+| `YTDLP_DOWNLOAD_FAILED` | 三个镜像全失败或校验不过 | 列出试过的镜像与各自失败原因 |
+| `TOOL_TEMP_UNAVAILABLE` | 子进程报 `Could not create temporary directory` | 指出 `TEMP` 不可写，建议改 `cacheDir`（F26） |
 | `BILI_UNSUPPORTED_CONTENT` | 番剧/课程/直播回放 | 说明 v1 不支持 |
 | `BILI_NEEDS_LOGIN` | `--no-local` 且字幕不可用 | 说明如何配置 `BILI_SESSDATA` |
 | `SUBTITLE_FETCH_FAILED` | 字幕下载失败 | 附原因；已回落本地 |
@@ -782,7 +827,7 @@ ctx.commands.register({
 | LLM 输入 | 约 6k token（1 小时）；上下文 1M，单次足够 |
 | 峰值磁盘 | 音频 + WAV + 缓存 < 500 MB（1 小时） |
 | 峰值内存 | 完整 PCM 常驻（1 小时 = 115 MB）+ 单片 WAV（≤ 1 MB） |
-| 外部请求 | 仅 GitHub（首次取 yt-dlp，17 MB）。**无 B 站 API 直连**——风控风险整体移交 yt-dlp |
+| 外部请求 | GitHub（首次取 yt-dlp，17 MB，需镜像或代理）+ yt-dlp 自身对 B 站的请求（**必须直连**，见 F25）。风控风险仍在，只是实现责任移交 yt-dlp |
 
 ---
 
@@ -857,6 +902,10 @@ fixture 落库前**必须脱敏**：剥掉所有 URL 查询参数、`Cookie`/`Se
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
+| **系统代理出口被 B 站拦截** | 一切都 412，且极难自查（curl 直连通、yt-dlp 不通） | `proxy` 默认 `''` 强制直连；所有 yt-dlp 调用显式传 `--proxy=`；`YTDLP_BLOCKED` 给出可操作提示（F25/F27） |
+| **GitHub release 直连不通** | 自动下载 yt-dlp 失败 | 镜像链 `ghproxy.net` → `gh-proxy.com` → 直连；逐个校验 SHA-256（F28） |
+| **子进程 temp 不可写** | yt-dlp.exe 起不来，报 PyInstaller 错 | `childEnv()` 强制设 `TEMP`/`TMP`/`TMPDIR` 到 `<cacheDir>/tmp`（F26） |
+| 继承系统代理导致「本机能用、插件不能用」 | 最常见的"环境问题"型 bug | 代理策略分目标写死在配置层，`childEnv()` 是唯一构造子进程 env 的地方 |
 | yt-dlp 跟不上 B 站接口变更 | 全链路失效 | `--update-tools` 一键更新；`YTDLP_FAILED` 带 stderr 尾部便于定位；yt-dlp 版本写入诊断 |
 | 首次需下载 yt-dlp（17 MB） | 首次体验 | 进度落 `run.log`；校验 `SHA2-256SUMS`；失败给出手动放置路径 |
 | 宿主拒绝返回值（非无损 JSON） | 整次命令失败且难查 | 出口统一 `compact()`；`json.test.mjs` 对真实作业记录断言（F21） |
@@ -879,7 +928,7 @@ fixture 落库前**必须脱敏**：剥掉所有 URL 查询参数、`Cookie`/`Se
 
 1. 包骨架：`package.json` / `cordis.patch.yml` / `index.js` / `config.js` / `errors.js` / `json.js`
 2. `jobs.js` + 测试（落盘、串行、重启可查）
-3. `media/tools.js`（yt-dlp 定位/下载/自检）+ 测试
+3. `media/tools.js`（yt-dlp 定位/镜像链下载/SHA-256 校验/`childEnv` 临时目录与代理）+ 测试
 4. `media/ytdlp.js` probe + fixture 契约测试
 5. 依赖安装：`@ffmpeg-installer/win32-x64`
 6. `media/ffmpeg.js` + `audio/window.js`（规范 WAV + `planSegments`）+ 测试
@@ -914,6 +963,9 @@ fixture 落库前**必须脱敏**：剥掉所有 URL 查询参数、`Cookie`/`Se
 | 章节数上限 | `max(2, ceil(duration/60))` |
 | UP 主章节 | 有则作为提示词骨架并参与 validate 对照；无则忽略 |
 | 超长转写 | 单次调用；`LLM_CONTEXT_EXCEEDED` 时明确报错，map-reduce 留 P2 |
+| 代理 | 访问 B 站：**强制直连**（`proxy: ''`）；下载 yt-dlp：**跟随系统代理**（`toolDownloadProxy: 'system'`）。分目标，因为本机两者要求相反（F25） |
+| 子进程临时目录 | 一律由 `childEnv()` 设为 `<cacheDir>/tmp`（F26） |
+| 音轨选择 | 显式 format_id：`balanced`→30232 / `smallest`→30216 / `best`→30280（F29） |
 | 缓存淘汰 | v1 不自动淘汰；LRU 留 P2 |
 | 非 B 站站点 | v1 拒绝。yt-dlp 使其几乎免费，但留 P2 并需单独验收 |
 
@@ -960,3 +1012,86 @@ fixture 落库前**必须脱敏**：剥掉所有 URL 查询参数、`Cookie`/`Se
 | moonmoonCL/bilibili-transcript | 确认 yt-dlp 取 B站字幕可行 → 取数层换 yt-dlp |
 | yt-dlp 源码 F16/F17 | 确认字幕（SRT）与 UGC 章节（`view_points`）两条能力 |
 | dsh-tool-transcribe | 印证"带时间戳输出"是本类工具的稀缺能力，也是我们的核心价值 |
+
+---
+
+## 17. Spike 实测记录（2026-10-12）
+
+Spike 目的：验证路线 A（yt-dlp 取数）在本机是否真的可行。结论：**可行，但有两个必须先解决的环境陷阱。**
+
+### 17.1 验证通过
+
+| 项 | 结果 |
+|---|---|
+| yt-dlp.exe 下载 | GitHub 直连不通；`ghproxy.net` 200，得 17,840,399 B |
+| SHA-256 校验 | 与官方 `SHA2-256SUMS` **一致** |
+| `--version` | `2026.08.19`（需显式 `TEMP`） |
+| `probe` | `extractor=BiliBili`、`title`、`duration=212.393`、`uploader`、`formats=15` 全部正确 |
+| 音轨清单 | `30216` m4a mp4a.40.5 44k / `30232` m4a mp4a.40.2 103k / `30280` m4a mp4a.40.2 204k |
+| 音频下载 | `-f 30232` 得 2.61 MB / 约 2 s |
+| 音频容器 | 文件头 `ftyp iso5 … avc1 iso5 dsms msix dash` → **fMP4 + AAC**，ffmpeg 的合法输入 |
+| 匿名字幕 | `subtitles=[]`、`automatic_captions=[]` —— 与 F2 一致 |
+
+### 17.2 两个环境陷阱（都已实测复现 + 找到修复）
+
+**陷阱 1：系统代理**
+
+```
+ProxyEnable = 1, ProxyServer = 127.0.0.1:7890      ← 本机开着 Clash 类代理
+```
+
+`yt-dlp`（Python urllib）**继承**系统代理；`curl.exe` **不继承**。于是出现最容易误判的现象——**同一个 URL，curl 200、yt-dlp 412**。
+
+排查过程与排除项（都试过、都不是原因）：
+
+| 变量 | 结论 |
+|---|---|
+| User-Agent | 手动换成 Chrome UA，仍 412 |
+| Referer | 已带，仍 412 |
+| Cookie（`buvid3`/`b_nut`） | 带真实 cookie 文件，仍 412 |
+| HTTP 版本 | curl 用 `--http1.1` 仍 200 |
+| TLS 指纹 | `--impersonate chrome`（curl_cffi）仍 412 |
+| IPv4/IPv6 | `--force-ipv4` 仍 412 |
+| **代理** | ✅ **`--proxy=`（空）→ 成功；`NO_PROXY=*` → 成功** |
+
+`--print-traffic` 抓到的决定性证据：
+
+```
+send: b'CONNECT www.bilibili.com:443 HTTP/1.0'       ← 走代理隧道
+Cookie: b_nut=...; buvid3=...; X-BILI-SEC-TOKEN=3,eyJ...
+reply: 'HTTP/1.1 412 Precondition Failed'
+```
+
+那个 `X-BILI-SEC-TOKEN` 的 JWT 载荷里写着 `"ip":"103.151.172.70"` —— **不是本机 IP**，是代理出口。B 站按出口 IP 判定并返回 412。
+
+**陷阱 2：临时目录**
+
+```
+& yt-dlp.exe --version
+→ [PYI-25504:ERROR] Could not create temporary directory!
+```
+
+`yt-dlp.exe` 是 PyInstaller onefile，需要在 temp 里解包并加载 DLL。默认 `TEMP` 下失败（该目录从 PowerShell 手动建目录却成功，说明不是朴素的可写性问题，而是子进程解包/加载受限）。显式把 `TEMP`/`TMP`/`TMPDIR` 指向工作区下的自定义目录后正常：
+
+```
+2026.08.19
+```
+
+### 17.3 未验证（本轮受限于风控与凭据）
+
+| 项 | 原因 | 何时验证 |
+|---|---|---|
+| **字幕通路** | 需要用户的 `SESSDATA`；匿名 `subtitles=[]` 符合预期但未取到真实字幕 | P1 实施时（E2E-2） |
+| **UP 主章节** | 试的视频没有章节；B 站搜索接口也返回 412，无法批量找带章节的视频。源码层已确认 `_get_chapters` → `view_points` | P1 实施时（E2E-4） |
+| 端到端（下载→解码→分片→识别） | 未装 ffmpeg、未下 SenseVoice 模型 | P0 实施时（E2E-1） |
+
+### 17.4 Spike 对规格的修正
+
+| 修正 | 依据 |
+|---|---|
+| 新增 `proxy` / `toolDownloadProxy` 两个配置项，默认分目标 | F25 |
+| `childEnv()` 成为子进程 env 的唯一构造点，强制 `TEMP` 与代理 | F25/F26 |
+| yt-dlp 下载走镜像链 + SHA-256 校验 | F28 |
+| 新增 `YTDLP_BLOCKED` / `YTDLP_DOWNLOAD_FAILED` / `TOOL_TEMP_UNAVAILABLE` 三个错误码 | 17.2 |
+| **删除** v2 中"换用 yt-dlp 就能绕开 B 站风控"的表述 | F27 —— 风控在出口 IP 层，yt-dlp 也绕不开 |
+| 音轨选择由 `bestaudio` 改为**显式 format_id**（30232/30216/30280） | F29 |
