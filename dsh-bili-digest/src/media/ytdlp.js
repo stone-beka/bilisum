@@ -7,8 +7,36 @@ import { checkTools, childEnv, proxyArg, resolveYtDlp, spawnEnv } from './tools.
  * 单路输出上限。probe 的 JSON 正常在 1 MB 以内；给到 64 MB 是为了不把内存
  * 交给对面控制（合集/番剧的巨型 JSON 是唯一接近这个量级的场景）。
  * 超限后只停止累积，不中断子进程——读到的前缀仍可进错误消息。
+ * 可经 `runYtDlp` 的 `options.maxBuffer` 覆盖（单测用小值触发截断分支）。
  */
 const MAX_BUFFER = 64 * 1024 * 1024
+
+/** 截断标记：被截断的输出必须自己说明「不完整」，否则下游会把前缀当成完整输出。 */
+const TRUNCATION_MARK = '\n…[yt-dlp 输出超过上限，已截断：后续内容未捕获]'
+
+/**
+ * 带上限的分片累积器。到达上限后，只在后到的第一个分片上追加一次截断标记，
+ * 之后不再累积——标记让「输出不完整」在下游可见，而不是伪装成完整输出。
+ * @param limit 字节上限（以字符串长度计）
+ */
+function cappedText(limit) {
+  let text = ''
+  let truncated = false
+  return {
+    push(chunk) {
+      if (truncated) return
+      if (text.length >= limit) {
+        truncated = true
+        text += TRUNCATION_MARK
+        return
+      }
+      text += chunk
+    },
+    value() {
+      return text
+    },
+  }
+}
 
 /** 风控的唯一指纹。规格 F27 钉的是 stderr 里的 `HTTP Error 412`；
  *  `Precondition Failed` 是同一响应的状态行文本，HTML 错误页里也带。 */
@@ -61,6 +89,14 @@ export function classifyYtDlpFailure(stderr) {
 }
 
 /**
+ * exe 缺失时的统一错误：文案复用 checkTools，放置路径与配置项只在一处维护。
+ * `runYtDlp` 与 `probe` 都用它，保证「找不到 yt-dlp」在两条入口上是同一个码。
+ */
+function missingYtDlpError(config) {
+  return new BiliDigestError('YTDLP_MISSING', '找不到 yt-dlp.exe', checkTools(config).ytDlp)
+}
+
+/**
  * 跑一次 yt-dlp。参数一律走数组、不经 shell。
  *
  * 环境**只能**来自 `childEnv`：它显式设 TEMP/TMP/TMPDIR（PyInstaller 起不来的根因）
@@ -71,26 +107,30 @@ export function classifyYtDlpFailure(stderr) {
  * @param options.signal 取消信号；中止时 kill 子进程并抛 CANCELLED
  * @param options.onStderr stderr 分片回调（诊断用）
  * @param options.spawnImpl spawn 注入点，默认 `node:child_process` 的 spawn（全部单测离线跑）
+ * @param options.env 已由 `childEnv()` 造好的环境（`probe` 用它，避免同一次调用里重复构造 +
+ *        `mkdirSync`）；省略时本函数自己调 `childEnv(config, 'bilibili')`
+ * @param options.maxBuffer 单路输出上限，默认 `MAX_BUFFER`（单测用小值触发截断分支）
  * @returns {Promise<{stdout:string, stderr:string, code:number}>}
- * @throws BiliDigestError YTDLP_MISSING / YTDLP_BLOCKED / TOOL_TEMP_UNAVAILABLE / YTDLP_FAILED / CANCELLED
+ * @throws BiliDigestError YTDLP_MISSING / BAD_CONFIG / YTDLP_BLOCKED / TOOL_TEMP_UNAVAILABLE / YTDLP_FAILED / CANCELLED
  */
-export function runYtDlp(config, args, { signal, onStderr, spawnImpl = defaultSpawn } = {}) {
+export function runYtDlp(
+  config,
+  args,
+  { signal, onStderr, spawnImpl = defaultSpawn, env: prebuiltEnv, maxBuffer } = {},
+) {
   if (signal?.aborted) return Promise.reject(cancelled())
 
   const exe = resolveYtDlp(config)
-  if (!exe) {
-    // 复用 checkTools 的文案：放置路径与配置项只在一处维护
-    return Promise.reject(
-      new BiliDigestError('YTDLP_MISSING', '找不到 yt-dlp.exe', checkTools(config).ytDlp),
-    )
-  }
+  if (!exe) return Promise.reject(missingYtDlpError(config))
 
-  let env
-  try {
-    env = childEnv(config, 'bilibili')
-  } catch (err) {
-    // BAD_CONFIG（cacheDir 未配置等）原样上抛：这不是 yt-dlp 的失败，别误分类
-    return Promise.reject(err)
+  let env = prebuiltEnv
+  if (!env) {
+    try {
+      env = childEnv(config, 'bilibili')
+    } catch (err) {
+      // BAD_CONFIG（cacheDir 未配置等）原样上抛：这不是 yt-dlp 的失败，别误分类
+      return Promise.reject(err)
+    }
   }
 
   return new Promise((resolve, reject) => {
@@ -106,8 +146,8 @@ export function runYtDlp(config, args, { signal, onStderr, spawnImpl = defaultSp
       return
     }
 
-    let out = ''
-    let err = ''
+    const out = cappedText(maxBuffer ?? MAX_BUFFER)
+    const err = cappedText(maxBuffer ?? MAX_BUFFER)
     const onAbort = () => {
       try {
         child.kill()
@@ -119,12 +159,12 @@ export function runYtDlp(config, args, { signal, onStderr, spawnImpl = defaultSp
     signal?.addEventListener('abort', onAbort, { once: true })
 
     child.stdout.on('data', (chunk) => {
-      if (out.length < MAX_BUFFER) out += chunk.toString()
+      out.push(chunk.toString())
     })
     child.stderr.on('data', (chunk) => {
       const text = chunk.toString()
       onStderr?.(text)
-      if (err.length < MAX_BUFFER) err += text
+      err.push(text)
     })
 
     child.on('error', (e) => {
@@ -138,10 +178,10 @@ export function runYtDlp(config, args, { signal, onStderr, spawnImpl = defaultSp
         return
       }
       if (code !== 0) {
-        reject(classifyYtDlpFailure(err || out))
+        reject(classifyYtDlpFailure(err.value() || out.value()))
         return
       }
-      resolve({ stdout: out, stderr: err, code })
+      resolve({ stdout: out.value(), stderr: err.value(), code })
     })
   })
 }
@@ -168,6 +208,15 @@ export function buildProbeArgs(url, cookieFile, proxyPolicy = '') {
 
 /** 字符串字段归一：null/undefined → ''，其余 String 后 trim。 */
 const text = (value) => (value == null ? '' : String(value).trim())
+
+/**
+ * 字符串数组归一：**只留真正的字符串**，经 `text()` trim 掉空串。
+ * 直接 `map(String)` 会把 null 变成 `'null'`、对象变成 `'[object Object]'`——那是伪数据。
+ */
+const stringList = (value) =>
+  Array.isArray(value)
+    ? value.filter((item) => typeof item === 'string').map(text).filter((item) => item !== '')
+    : []
 
 /** 数值字段归一：非有限数（缺字段、null、'abc'、NaN）一律降级成 fallback。
  *  不能让 NaN 漏出去——它不是合法 JSON，会在宿主那层被当成"value is not lossless JSON"拒收。 */
@@ -220,7 +269,7 @@ export function reduceProbe(raw) {
     uploader: text(raw?.uploader),
     webpageUrl: text(raw?.webpage_url),
     description: text(raw?.description),
-    tags: Array.isArray(raw?.tags) ? raw.tags.map(String) : [],
+    tags: stringList(raw?.tags),
     chapters,
     subtitles,
     isPlaylist: false,
@@ -232,26 +281,41 @@ export function reduceProbe(raw) {
  * 取一次元信息 / 章节 / 字幕清单。
  *
  * 代理策略取自 `childEnv(config, 'bilibili').__proxy`——它是**策略值**不是 URL。
- * 412 有两个来源，都在进 JSON.parse 之前判掉：非零退出的 stderr，以及 stdout 直接是
- * HTML 错误页（风控页的 content-type 是 text/html）。这样用户拿到的是「风控」，
- * 而不是一个 "Unexpected token < in JSON" 的解析错。
+ * 这份 env 同时透传给 `runYtDlp`，同一次 probe 不重复构造环境（含 `mkdirSync`）。
+ *
+ * 顺序是可观测的契约：**先判可执行文件**（exe 缺失时直接 `YTDLP_MISSING`，否则这个码
+ * 会被迟到的检查掩盖、永远发不出来），再构造 env（cacheDir 空则 `BAD_CONFIG`），最后起进程。
+ *
+ * 412 有两个来源，都在进 JSON.parse 之前判掉：① 非零退出的 stderr / stdout
+ * （`runYtDlp` 的 `classifyYtDlpFailure`）；② stdout 本身带 412 指纹。②**与响应体
+ * 是不是 HTML 形状无关**——风控页可能以注释、`<script>`、BOM 残留起头，只按 `HTML_RE`
+ * 分流会把风控误报成 "不是合法 JSON"。这样用户拿到的始终是「风控」。
  *
  * @param config 已解析配置
  * @param url 已归一化的视频地址
  * @param options.cookieFile 登录态 cookie 文件；**不给就视为匿名跑，不宣称有字幕**
  * @param options.onProgress 进度回调（返回值过 compact）
  * @param options.spawnImpl spawn 注入点（单测用）
- * @throws BiliDigestError YTDLP_BLOCKED / YTDLP_FAILED / BILI_UNSUPPORTED_CONTENT / CANCELLED
+ * @throws BiliDigestError YTDLP_MISSING（找不到 yt-dlp.exe）/ BAD_CONFIG（cacheDir 未配置等）/
+ *         YTDLP_BLOCKED（412 风控）/ TOOL_TEMP_UNAVAILABLE（PyInstaller 建不了临时目录）/
+ *         YTDLP_FAILED（其余失败、HTML 拦截页、非法 JSON、缺 id）/ BILI_UNSUPPORTED_CONTENT（合集/番剧）/ CANCELLED
  */
 export async function probe(config, url, { cookieFile, signal, onProgress, spawnImpl } = {}) {
-  const proxy = childEnv(config, 'bilibili').__proxy ?? ''
+  if (!resolveYtDlp(config)) throw missingYtDlpError(config)
+
+  const env = childEnv(config, 'bilibili')
+  const proxy = env.__proxy ?? ''
   onProgress?.(compact({ phase: 'probe' }))
 
-  const { stdout } = await runYtDlp(config, buildProbeArgs(url, cookieFile, proxy), { signal, spawnImpl })
+  const { stdout } = await runYtDlp(config, buildProbeArgs(url, cookieFile, proxy), {
+    signal,
+    spawnImpl,
+    env,
+  })
 
   const body = stdout.trim()
+  if (HTTP_412_RE.test(body)) throw blockedError()
   if (HTML_RE.test(body)) {
-    if (HTTP_412_RE.test(body)) throw blockedError()
     throw new BiliDigestError(
       'YTDLP_FAILED',
       'yt-dlp 返回的是 HTML 页面而不是 JSON',
@@ -294,10 +358,3 @@ export async function version(config, { signal, spawnImpl } = {}) {
   const { stdout } = await runYtDlp(config, ['--version'], { signal, spawnImpl })
   return stdout.trim()
 }
-
-/**
- * 任务书（Lead 转述）把这组接口叫 `probeVideo` / `ytDlpVersion`，
- * 而规格 §5.5 与计划里后续任务的 `import` 用的是 `probe` / `version`。
- * 两个名字都导出，避免任一侧的调用方踩空。
- */
-export { probe as probeVideo, version as ytDlpVersion }

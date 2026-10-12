@@ -10,11 +10,9 @@ import {
   buildProbeArgs,
   classifyYtDlpFailure,
   probe,
-  probeVideo,
   reduceProbe,
   runYtDlp,
   version,
-  ytDlpVersion,
 } from '../src/media/ytdlp.js'
 import { resolveConfig } from '../src/config.js'
 
@@ -24,9 +22,11 @@ const fixture = JSON.parse(await readFile(join(here, 'fixtures', 'probe.json'), 
 /**
  * 可注入的假 spawn：只回放预设的 stdout/stderr/退出码，**永不启动真实进程**。
  * runYtDlp 在 spawn 返回后才挂监听，所以数据走 setImmediate 异步发。
+ * @param options.stdoutChunks stdout 的多个分片；每个分片占一个 setImmediate，
+ *        保证是独立的 'data' 事件（测截断必须能精确控制"第几个分片越限"）
  * @param options.hang true = 不主动 close，只能靠 kill 收场（测中止）
  */
-function fakeSpawn({ stdout = '', stderr = '', code = 0, error, hang = false } = {}) {
+function fakeSpawn({ stdout = '', stderr = '', code = 0, error, hang = false, stdoutChunks } = {}) {
   const calls = []
   const spawnImpl = (exe, args, options) => {
     const child = new EventEmitter()
@@ -39,16 +39,31 @@ function fakeSpawn({ stdout = '', stderr = '', code = 0, error, hang = false } =
       return true
     }
     calls.push({ exe, args, options, kills })
+    /** 顺序写分片，每个分片一个宏任务：绝不让 Node 把多片合并成一个 'data'。 */
+    const writeEach = (stream, chunks, done) => {
+      let index = 0
+      const step = () => {
+        if (index >= chunks.length) {
+          done()
+          return
+        }
+        stream.write(chunks[index])
+        index += 1
+        setImmediate(step)
+      }
+      step()
+    }
     setImmediate(() => {
       if (error) {
         child.emit('error', error)
         return
       }
-      if (stdout) child.stdout.write(stdout)
-      if (stderr) child.stderr.write(stderr)
-      child.stdout.end()
-      child.stderr.end()
-      if (!hang) setImmediate(() => child.emit('close', code))
+      writeEach(child.stdout, stdoutChunks ?? (stdout ? [stdout] : []), () => {
+        if (stderr) child.stderr.write(stderr)
+        child.stdout.end()
+        child.stderr.end()
+        if (!hang) setImmediate(() => child.emit('close', code))
+      })
     })
     return child
   }
@@ -141,6 +156,20 @@ test('reduceProbe 把 subtitles 的对象键取成语言列表，非对象归一
   const withSubs = reduceProbe({ id: 'BV1', subtitles: { 'zh-Hans': [{ ext: 'json' }], en: [] } })
   assert.deepEqual(withSubs.subtitles, ['zh-Hans', 'en'])
   assert.deepEqual(reduceProbe({ id: 'BV1', subtitles: null }).subtitles, [])
+})
+
+test('reduceProbe 的 tags 只留真正的字符串（null/对象/空串都不是标签）', () => {
+  const info = reduceProbe({ id: 'BV1', tags: [' 音乐 ', null, { a: 1 }, '', undefined] })
+  // map(String) 会产出 'null' 与 '[object Object]'——那是伪数据，不许进 Probe
+  assert.deepEqual(info.tags, ['音乐'])
+  assert.deepEqual(reduceProbe({ id: 'BV1', tags: [null, {}] }).tags, [])
+  assert.deepEqual(reduceProbe({ id: 'BV1', tags: 'nope' }).tags, [])
+})
+
+test('reduceProbe 的 title 缺失或为空串时回落成 id', () => {
+  // 判别性：`title || id` 对 '' 也会回落，写成 `title ?? id` 则第一条会挂
+  assert.equal(reduceProbe({ id: 'BV1', title: '' }).title, 'BV1')
+  assert.equal(reduceProbe({ id: 'BV1' }).title, 'BV1')
 })
 
 test('reduceProbe 在 id 与 title 都缺失时抛错：这不是能降级的信息', () => {
@@ -252,6 +281,25 @@ test('runYtDlp 成功时返回 stdout/stderr/code，并用 childEnv 的环境启
   assert.ok(!('__proxy' in calls[0].options.env), '__proxy 不能外泄给子进程')
 })
 
+test('runYtDlp 用传入的 env 时不再自己构造环境，且仍剥掉 __proxy', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'ytdlp-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const exe = join(dir, 'yt-dlp.exe')
+  await writeFile(exe, 'placeholder')
+  // cacheDir 为空：若 runYtDlp 仍自己调 childEnv，这里会抛 BAD_CONFIG（这正是判别点）
+  const cfg = resolveConfig({ cacheDir: '', ytDlpPath: exe })
+  const { spawnImpl, calls } = fakeSpawn({ stdout: '{"ok":true}' })
+
+  const res = await runYtDlp(cfg, ['--version'], {
+    spawnImpl,
+    env: { TEMP: 'X:/tmp', __proxy: 'http://127.0.0.1:1080' },
+  })
+
+  assert.equal(res.stdout, '{"ok":true}')
+  assert.equal(calls[0].options.env.TEMP, 'X:/tmp', '注入的 env 必须原样透传')
+  assert.ok(!('__proxy' in calls[0].options.env), '注入的 env 也要过 spawnEnv')
+})
+
 test('runYtDlp 非零退出且 stderr 含 412 时抛 YTDLP_BLOCKED', async (t) => {
   const { dir, cfg } = await fixtureConfig()
   t.after(() => rm(dir, { recursive: true, force: true }))
@@ -261,6 +309,31 @@ test('runYtDlp 非零退出且 stderr 含 412 时抛 YTDLP_BLOCKED', async (t) =
     () => runYtDlp(cfg, ['x'], { spawnImpl }),
     errorWith('YTDLP_BLOCKED', { message: /412|风控|拒绝/, hint: /BILI_SESSDATA/ }),
   )
+})
+
+test('runYtDlp 非零退出且 stderr 为空时，从 stdout 里认出 412（err || out 回退）', async (t) => {
+  const { dir, cfg } = await fixtureConfig()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  // yt-dlp 有时把失败正文只写 stdout：只看 stderr 会把风控降级成普通失败
+  const { spawnImpl } = fakeSpawn({ stdout: 'ERROR: HTTP Error 412: Precondition Failed', code: 1 })
+
+  await assert.rejects(
+    () => runYtDlp(cfg, ['x'], { spawnImpl }),
+    errorWith('YTDLP_BLOCKED', { hint: /BILI_SESSDATA/ }),
+  )
+})
+
+test('runYtDlp 输出超过 maxBuffer 时截断，并留下可见的截断标记', async (t) => {
+  const { dir, cfg } = await fixtureConfig()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const { spawnImpl } = fakeSpawn({ stdoutChunks: ['aaaa', 'bbbb', 'cccc'] })
+
+  const res = await runYtDlp(cfg, ['x'], { spawnImpl, maxBuffer: 4 })
+
+  assert.equal(res.stdout.slice(0, 4), 'aaaa', '上限内的前缀要保留')
+  assert.match(res.stdout, /截断/, '截断必须自己声明，不能伪装成完整输出')
+  assert.ok(!res.stdout.includes('bbbb'), '越限后的分片不再累积')
+  assert.ok(!res.stdout.includes('cccc'))
 })
 
 test('runYtDlp 非零退出且非 412 时抛 YTDLP_FAILED 并附 stderr 尾部', async (t) => {
@@ -438,6 +511,54 @@ test('probe 在 stdout 是 412 的 HTML 错误页时给风控消息，而不是 
   assert.match(String(err.hint), /BILI_SESSDATA/)
 })
 
+test('probe 在 stdout 带 412 但不是 HTML 形状时也给风控（412 判定不依赖 HTML 形状）', async (t) => {
+  const { dir, cfg } = await fixtureConfig()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  // 风控页可能以 BOM/注释/<script> 起头：只按 HTML_RE 分流会误报成「不是合法 JSON」
+  const body = '\uFEFF<!-- blocked --><script>HTTP Error 412: Precondition Failed</script>'
+  const { spawnImpl } = fakeSpawn({ stdout: body })
+
+  const err = await probe(cfg, 'https://x', { spawnImpl }).then(
+    () => null,
+    (e) => e,
+  )
+  assert.equal(err.code, 'YTDLP_BLOCKED')
+  assert.doesNotMatch(err.message, /JSON/)
+})
+
+test('probe 在找不到 yt-dlp.exe 时抛 YTDLP_MISSING，且不启动进程', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'ytdlp-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const { spawnImpl, calls } = fakeSpawn({ stdout: JSON.stringify(fixture) })
+  const cfg = resolveConfig({ cacheDir: dir })
+
+  await assert.rejects(
+    () => probe(cfg, 'https://x', { spawnImpl }),
+    errorWith('YTDLP_MISSING', { message: /yt-dlp/, hint: /yt-dlp\.exe/ }),
+  )
+  // 判别性：childEnv 排在 exe 检查之前时，cacheDir 为空会先抛 BAD_CONFIG，
+  // YTDLP_MISSING 就永远发不出来。顺序必须是「先找 exe，再造 env」。
+  await assert.rejects(
+    () => probe(resolveConfig({ cacheDir: '' }), 'https://x', { spawnImpl }),
+    errorWith('YTDLP_MISSING'),
+  )
+  assert.equal(calls.length, 0, '找不到 exe 时不该 spawn')
+})
+
+test('probe 对未解析配置（缺 proxy 项）抛 BAD_CONFIG，不误分类成 yt-dlp 失败', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'ytdlp-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  await mkdir(join(dir, 'bin'), { recursive: true })
+  await writeFile(join(dir, 'bin', 'yt-dlp.exe'), 'placeholder')
+  const { spawnImpl, calls } = fakeSpawn({ stdout: JSON.stringify(fixture) })
+
+  await assert.rejects(
+    () => probe({ cacheDir: dir }, 'https://x', { spawnImpl }),
+    errorWith('BAD_CONFIG', { hint: /resolveConfig/ }),
+  )
+  assert.equal(calls.length, 0)
+})
+
 test('probe 在 stdout 是 HTML 但不含 412 时抛 YTDLP_FAILED 并说明是 HTML', async (t) => {
   const { dir, cfg } = await fixtureConfig()
   t.after(() => rm(dir, { recursive: true, force: true }))
@@ -500,11 +621,4 @@ test('version 返回 trim 过的 yt-dlp 版本号', async (t) => {
 
   assert.equal(await version(cfg, { spawnImpl }), '2026.08.19')
   assert.deepEqual(calls[0].args, ['--version'])
-})
-
-// ---------- 别名：任务书用的是 probeVideo / ytDlpVersion ----------
-
-test('probeVideo / ytDlpVersion 是 probe / version 的别名（同一函数）', () => {
-  assert.equal(probeVideo, probe)
-  assert.equal(ytDlpVersion, version)
 })
