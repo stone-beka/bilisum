@@ -1,0 +1,35 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { resolveConfig } from '../src/config.js'
+import { BiliDigestError } from '../src/errors.js'
+
+test('空配置产出全部默认值', () => {
+  const c = resolveConfig()
+  assert.equal(c.command, 'bilisum')
+  assert.equal(c.windowSeconds, 30)
+  assert.equal(c.snapSeconds, 1.5)
+  assert.equal(c.audioQuality, 'balanced')
+  assert.equal(c.proxy, '')
+  assert.equal(c.toolDownloadProxy, 'system')
+  assert.equal(c.waitSeconds, 45)
+  assert.equal(c.keepTranscript, true)
+})
+
+test('windowSeconds 上限 60（F19：120 秒已进入衰退区）', () => {
+  assert.equal(resolveConfig({ windowSeconds: 60 }).windowSeconds, 60)
+  assert.throws(() => resolveConfig({ windowSeconds: 120 }), (e) => e.code === 'BAD_CONFIG')
+  assert.throws(() => resolveConfig({ windowSeconds: 20 }), (e) => e.code === 'BAD_CONFIG')
+})
+
+test('audioQuality 只接受三个枚举值', () => {
+  assert.equal(resolveConfig({ audioQuality: 'smallest' }).audioQuality, 'smallest')
+  assert.throws(() => resolveConfig({ audioQuality: 'ultra' }), (e) => e.code === 'BAD_CONFIG')
+})
+
+test('未知配置键被拒绝', () => {
+  assert.throws(() => resolveConfig({ nope: 1 }), (e) => e.code === 'BAD_CONFIG')
+})
+
+test('cacheDir 为空时由调用方补默认值，resolveConfig 不碰文件系统', () => {
+  assert.equal(resolveConfig().cacheDir, '')
+})
