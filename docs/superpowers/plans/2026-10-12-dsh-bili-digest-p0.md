@@ -1547,11 +1547,29 @@ git commit -m "feat(bili-digest): 外部工具定位与子进程环境（TEMP + 
 - Create: `test/tools-download.test.mjs`
 
 **Interfaces:**
-- Consumes: `childEnv` / `spawnEnv` / `ensureTmpDir`（Task 6）
+- Consumes: `cachePaths`（Task 3）、`BiliDigestError`（Task 2）。**原先写的 `childEnv`/`spawnEnv`/`ensureTmpDir` 是错的**——下载走 `fetch`，不 spawn 任何子进程，不要为了"用上"而硬塞依赖。
 - Produces:
-  - `const YTDLP_MIRRORS: (tag:string)=>string[]`
-  - `downloadYtDlp(config, { fetchImpl, onProgress, signal }): Promise<string>` —— 下载到 `<cacheDir>/bin/yt-dlp.exe` 并校验成功后才 rename 就位；全部失败抛 `YTDLP_DOWNLOAD_FAILED`
+  - `const YTDLP_TAG: string` —— 内置固定版本，`'2026.08.19'`
+  - `const YTDLP_SHA256: string` —— 该版本 `yt-dlp.exe` 的官方 SHA-256，**信任锚**
+  - `const YTDLP_MIRRORS: (tag:string)=>string[]` —— 有序，官方 GitHub URL 放最后
+  - `downloadYtDlp(config, { fetchImpl, onProgress, signal }): Promise<string>` —— 校验通过才 rename 就位；全部失败抛 `YTDLP_DOWNLOAD_FAILED`
   - `parseSums(text): Map<string,string>` —— 解析 `SHA2-256SUMS`
+
+**为什么必须把哈希钉在源码里（Task 7 评审发现，属安全裁决）**
+
+原设计从**同一条镜像链**取 `SHA2-256SUMS`，再拿它校验同一条链上的二进制。这只能证明"字节没被传坏"，**不能证明"字节来自官方"**：一个恶意镜像同时给出错误的二进制和与之匹配的 SUMS，会被当作 `verified: true` 装进去。那是**完整性**校验，不是**真实性**校验——而"防止装进错的东西"恰恰是这个函数存在的理由。
+
+`parseSums` 也不该被信任来定义"合法哈希长什么样"：`got` 永远是 64 位十六进制，与 `expected` 做**精确字符串相等**比较；放宽 `expected` 的长度只会让它更容易不匹配（fail-closed），不会放松安全性。
+
+**裁定：**
+
+- `YTDLP_SHA256` 钉在源码里，值必须与官方 `SHA2-256SUMS` 核对过。本机已核验：
+  `66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a`
+- 默认下载**必须**匹配这个钉死的哈希；不匹配就换下一个镜像；全部不匹配 → `YTDLP_DOWNLOAD_FAILED`。镜像只负责"取字节"，信任只来自源码。
+- `--update-tools` 的语义收敛为「**重装这个已核验的固定版本**」（修复被破坏或被病毒扫描改过的本地副本），不再追最新 tag——否则它就成了绕过校验的后门。
+- 想追新版本的用户走配置：新增 `ytDlpTag` + `ytDlpSha256` 两个**可选覆盖项，必须成对出现**；只给 tag 不给哈希 → `BAD_CONFIG`（那等于关掉校验）。
+- `SHA2-256SUMS` 仍可获取，但只作**诊断**（例如"官方哈希已变更，插件该更新了"），不作为放行依据。
+- 取不到任何哈希来源时**不再降级安装**：直接失败并说明。宁可让用户手动放一个二进制（`ytDlpPath`），也不要静默装进来路不明的东西。
 
 - [ ] **Step 1: 写失败测试**
 
