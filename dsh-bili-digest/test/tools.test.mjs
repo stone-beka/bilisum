@@ -7,6 +7,7 @@ import { isAbsolute, join, resolve } from 'node:path'
 import {
   resolveYtDlp,
   resolveFfmpeg,
+  resolveBundledFfmpeg,
   checkTools,
   childEnv,
   ensureTmpDir,
@@ -105,13 +106,15 @@ test('ffmpeg 都找不到时返回 undefined', async () => {
   })
 })
 
-test('checkTools 报出缺失项，键存在即有问题', async () => {
+test('checkTools 不再谎报 ffmpeg 缺失：显式路径无效但有内置副本时只报 ytDlp', async () => {
   await withDir(async (dir) => {
     const problems = checkTools(resolveConfig({ cacheDir: dir, ffmpegPath: join(dir, 'nope.exe') }))
     assert.equal(typeof problems.ytDlp, 'string')
-    assert.equal(typeof problems.ffmpeg, 'string')
-    // 只有两个键
-    assert.deepEqual(Object.keys(problems).sort(), ['ffmpeg', 'ytDlp'])
+    // F1：checkTools 与解码缝共用 resolveFfmpegExe（两段查找 ?? 内置副本）。
+    // 内置副本在 → 解码真的跑得动 → 这个键就必须缺席（旧断言在这里谎报缺失）。
+    assert.ok(resolveBundledFfmpeg(), '本用例前提：内置依赖里的 ffmpeg.exe 存在')
+    assert.equal(problems.ffmpeg, undefined, '有内置副本可用时 checkTools 不能报 ffmpeg 缺失')
+    assert.deepEqual(Object.keys(problems).sort(), ['ytDlp'])
   })
 })
 
@@ -124,12 +127,14 @@ test('两个工具都在时 checkTools 不含任何键', async () => {
   })
 })
 
-test('只有一个工具缺失时只报那一个键', async () => {
+test('只有一个工具缺失时只报那一个键：ffmpeg 由内置副本兜底，缺的只有 yt-dlp', async () => {
   await withDir(async (dir) => {
     mkdirSync(join(dir, 'bin'), { recursive: true })
-    writeFileSync(join(dir, 'bin', 'yt-dlp.exe'), 'x')
+    // bin 里什么都没有：yt-dlp 是真的缺（旧断言在这里也报过 ffmpeg）；ffmpeg 现在走
+    // 同一条「两段查找 ?? 内置副本」解析，能跑就不算缺失（F1）。
+    assert.ok(resolveBundledFfmpeg(), '本用例前提：内置依赖里的 ffmpeg.exe 存在')
     const problems = checkTools(resolveConfig({ cacheDir: dir }))
-    assert.deepEqual(Object.keys(problems), ['ffmpeg'])
+    assert.deepEqual(Object.keys(problems), ['ytDlp'])
   })
 })
 

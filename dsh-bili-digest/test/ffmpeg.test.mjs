@@ -2,13 +2,14 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { resolveConfig } from '../src/config.js'
 import { decodeToPcm, installFfmpeg } from '../src/media/ffmpeg.js'
-import { resolveBundledFfmpeg } from '../src/media/tools.js'
+import { checkTools, resolveBundledFfmpeg } from '../src/media/tools.js'
 
 /**
  * 可注入的假 spawn：只回放预设的 stdout/stderr/退出码，**永不启动真实进程**
@@ -69,6 +70,32 @@ async function fixtureConfig(overrides = {}) {
   mkdirSync(join(dir, 'bin'), { recursive: true })
   writeFileSync(join(dir, 'bin', 'ffmpeg.exe'), 'placeholder')
   return { dir, cfg }
+}
+
+/**
+ * 在隔离的临时树里加载**同一份源码的副本**，并种一个「只有 package.json、没有
+ * ffmpeg.exe」的 `@ffmpeg-installer/win32-x64`：
+ * - 副本的 `createRequire` 起点在临时树里，`require.resolve` 会命中我们种下的包目录；
+ * - 该目录里没有二进制，于是 `resolveBundledFfmpeg()` 真实地返回 undefined。
+ *
+ * 为什么要这么绕：**「两条解析都失败」（FFMPEG_MISSING）在生产里只有 node_modules
+ * 缺失/损坏时才可达**，装了依赖的进程内无法凭空制造。为了「好测」而给生产代码加一个
+ * resolver 注入点，会让这条测试不再验证真实的解析链；这里跑的是同一份源码、真的
+ * `createRequire`、真的 `existsSync`，只是把它放进一棵没有二进制的隔离树。
+ */
+async function loadIsolatedCopy() {
+  const dir = await mkdtemp(join(tmpdir(), 'ffmpeg-iso-'))
+  cpSync(fileURLToPath(new URL('../src', import.meta.url)), join(dir, 'src'), { recursive: true })
+  const pkgDir = join(dir, 'node_modules', '@ffmpeg-installer', 'win32-x64')
+  mkdirSync(pkgDir, { recursive: true })
+  writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name: '@ffmpeg-installer/win32-x64', version: '0.0.0' }))
+  const load = (rel) => import(pathToFileURL(join(dir, 'src', rel)).href)
+  return {
+    dir,
+    tools: await load(join('media', 'tools.js')),
+    ffmpeg: await load(join('media', 'ffmpeg.js')),
+    resolveConfig: (await load('config.js')).resolveConfig,
+  }
 }
 
 // ---------- installFfmpeg：把依赖里的二进制复制进 <cacheDir>/bin ----------
@@ -230,14 +257,58 @@ test('不再配置 ffmpegPath 且 bin 为空时，回落到内置依赖里的 ff
   assert.equal(res.pcm.length, 2)
 })
 
-test('decodeToPcm 找不到 ffmpeg 时抛 FFMPEG_MISSING，hint 给出两条补救路径，且不启动进程', async (t) => {
+test('F1：checkTools 不说 ffmpeg 缺失时，decodeToPcm 必须真的解析出可执行文件（字段不许撒谎）', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'ffmpeg-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  mkdirSync(join(dir, 'bin'), { recursive: true })
+  const cfg = resolveConfig({ cacheDir: dir })
+  const { spawnImpl, calls } = fakeSpawn({ stdoutChunks: [Buffer.from([7, 7])] })
+
+  // checkTools 用的是与解码缝同一条 resolveFfmpegExe：bin 为空但内置副本在 → 不报缺失
+  assert.equal(checkTools(cfg).ffmpeg, undefined, 'bin 为空但有内置副本时 checkTools 不许报缺失')
+
+  const res = await decodeToPcm(cfg, join(dir, 'a.m4s'), { spawnImpl })
+
+  assert.equal(calls[0].exe, resolveBundledFfmpeg())
+  assert.ok(existsSync(calls[0].exe), 'spawn 用的 exe 必须是真实存在的文件')
+  assert.equal(res.pcm.length, 2)
+})
+
+test('F1：显式 ffmpegPath 指向不存在的文件时回落到内置副本（不再抛 FFMPEG_MISSING）', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'ffmpeg-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   mkdirSync(join(dir, 'bin'), { recursive: true })
   const cfg = resolveConfig({ cacheDir: dir, ffmpegPath: join(dir, 'nope.exe') })
-  const { spawnImpl, calls } = fakeSpawn({})
+  const { spawnImpl, calls } = fakeSpawn({ stdoutChunks: [Buffer.from([1])] })
 
-  const err = await decodeToPcm(cfg, join(dir, 'a.m4s'), { spawnImpl }).then(
+  await decodeToPcm(cfg, join(dir, 'a.m4s'), { spawnImpl })
+
+  // F1 裁定：显式路径失效不再否决内置副本；checkTools 也随之不再报缺失（字段==真实能力）
+  assert.equal(checkTools(cfg).ffmpeg, undefined)
+  assert.equal(calls[0].exe, resolveBundledFfmpeg())
+})
+
+test('F1：两条解析都失败时，checkTools 报缺失且 decodeToPcm 抛 FFMPEG_MISSING（同一套解析，hint 给两条补救）', async (t) => {
+  const { dir, tools, ffmpeg, resolveConfig: isoResolveConfig } = await loadIsolatedCopy()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const cache = join(dir, 'cache')
+  mkdirSync(join(cache, 'bin'), { recursive: true })
+  const cfg = isoResolveConfig({ cacheDir: cache })
+
+  // 前提：隔离树里内置副本确实解析不到（种了包目录、没有 exe），两段查找也落空
+  assert.equal(tools.resolveBundledFfmpeg(), undefined, '隔离树里必须解析不到内置副本')
+  assert.equal(tools.resolveFfmpeg(cfg), undefined)
+
+  const problems = tools.checkTools(cfg)
+  assert.equal(typeof problems.ffmpeg, 'string', '真的没有 ffmpeg 时 checkTools 仍要报出来')
+  assert.match(problems.ffmpeg, /ffmpegPath/)
+
+  const calls = []
+  const spawnImpl = (...args) => {
+    calls.push(args)
+    throw new Error('不该走到 spawn')
+  }
+  const err = await ffmpeg.decodeToPcm(cfg, join(dir, 'a.m4s'), { spawnImpl }).then(
     () => null,
     (e) => e,
   )
@@ -262,6 +333,24 @@ test('decodeToPcm 非零退出抛 AUDIO_DECODE_FAILED，hint 只留 stderr 尾�
   assert.equal(err?.code, 'AUDIO_DECODE_FAILED')
   assert.match(String(err.hint), /line-25/, '末尾的报错正文必须在 hint 里')
   assert.ok(!String(err.hint).includes('line-5\n'), 'hint 只留末尾若干行，不带几十行噪声')
+})
+
+test('F3：stderr 超过 64 KB 上限后保留的是尾部，不是开头', async (t) => {
+  const { dir, cfg } = await fixtureConfig()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  // 头部一行 70 KB（超过 MAX_STDERR）＋ 真正的报错在最后一行：
+  // 旧实现「满了就不再累积」留下的是开头 64 KB，TAIL-MARKER 会丢，HEAD-MARKER 会留。
+  const head = `HEAD-MARKER ${'x'.repeat(70 * 1024)}`
+  const { spawnImpl } = fakeSpawn({ stderr: `${head}\nTAIL-MARKER: could not open input`, code: 1 })
+
+  const err = await decodeToPcm(cfg, join(dir, 'a.m4s'), { spawnImpl }).then(
+    () => null,
+    (e) => e,
+  )
+
+  assert.equal(err?.code, 'AUDIO_DECODE_FAILED')
+  assert.match(String(err.hint), /TAIL-MARKER/, '失败原因在最后一行，必须留在诊断里')
+  assert.ok(!String(err.hint).includes('HEAD-MARKER'), '开头的 64 KB 应被滑动窗口丢掉')
 })
 
 test('decodeToPcm 退出码为 0 但没有 stderr 时正常返回空输出', async (t) => {
@@ -289,6 +378,47 @@ test('decodeToPcm 把 spawn 的 error 事件转成 AUDIO_DECODE_FAILED 并保留
   assert.equal(err?.code, 'AUDIO_DECODE_FAILED')
   assert.equal(err.cause, boom)
   assert.match(String(err.hint), /spawn EPERM/)
+})
+
+test('F5：spawnImpl 同步抛错时抛 AUDIO_DECODE_FAILED 并保留 cause', async (t) => {
+  const { dir, cfg } = await fixtureConfig()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const boom = new Error('spawn 调用即抛')
+  const spawnImpl = () => {
+    throw boom
+  }
+
+  const err = await decodeToPcm(cfg, join(dir, 'a.m4s'), { spawnImpl }).then(
+    () => null,
+    (e) => e,
+  )
+
+  assert.equal(err?.code, 'AUDIO_DECODE_FAILED')
+  assert.equal(err.cause, boom)
+  assert.match(String(err.message), /无法启动 ffmpeg/)
+})
+
+test('F5：cacheDir 未配置时 BAD_CONFIG 原样上抛，不误分类为解码失败', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'ffmpeg-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const exe = join(dir, 'ffmpeg.exe')
+  writeFileSync(exe, 'placeholder')
+  // 显式 ffmpegPath 让 exe 能解析出来（否则会先撞 FFMPEG_MISSING），cacheDir 留空 → childEnv 抛 BAD_CONFIG
+  const cfg = resolveConfig({ ffmpegPath: exe })
+  const calls = []
+  const spawnImpl = (...args) => {
+    calls.push(args)
+    throw new Error('不该走到 spawn')
+  }
+
+  const err = await decodeToPcm(cfg, join(dir, 'a.m4s'), { spawnImpl }).then(
+    () => null,
+    (e) => e,
+  )
+
+  assert.equal(err?.code, 'BAD_CONFIG')
+  assert.equal(err.name, 'BiliDigestError')
+  assert.equal(calls.length, 0, 'BAD_CONFIG 必须在 spawn 之前抛出')
 })
 
 test('decodeToPcm 已中止的 signal 不启动进程，直接抛 CANCELLED', async (t) => {
@@ -325,6 +455,31 @@ test('decodeToPcm 运行中中止时 kill 子进程并抛 CANCELLED', async (t) 
   assert.equal(err?.code, 'CANCELLED')
   assert.equal(calls.length, 1)
   assert.equal(calls[0].kills.length, 1, '中止必须 kill 子进程')
+})
+
+test('F4：中止落在 spawn 与注册 abort 监听之间时也要 kill（否则子进程跑到底）', async (t) => {
+  const { dir, cfg } = await fixtureConfig()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const ac = new AbortController()
+  const { spawnImpl, calls } = fakeSpawn({})
+  // 精确命中竞态窗口：abort 发生在 spawn 之后（子进程对象已建）、监听器注册之前。
+  // 修复前 addEventListener 不会补发这次 abort → kills 为 0（子进程一路跑完）。
+  const racingSpawn = (exe, args, options) => {
+    ac.abort()
+    return spawnImpl(exe, args, options)
+  }
+
+  const err = await decodeToPcm(cfg, join(dir, 'a.m4s'), {
+    spawnImpl: racingSpawn,
+    signal: ac.signal,
+  }).then(
+    () => null,
+    (e) => e,
+  )
+
+  assert.equal(err?.code, 'CANCELLED')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].kills.length, 1, '窗口内落下的中止必须补上 kill')
 })
 
 // ---------- 真实性检查：内置依赖确实带着一个可执行文件 ----------

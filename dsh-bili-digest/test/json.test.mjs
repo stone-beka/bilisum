@@ -30,7 +30,7 @@ test('compact 原样返回标量', () => {
   assert.equal(compact(null), null)
 })
 
-test('compact 原样返回 Buffer / TypedArray（二进制不是可递归的普通对象）', () => {
+test('compact 原样返回 Buffer / TypedArray / ArrayBuffer（二进制不是可递归的普通对象）', () => {
   // Object.entries(Buffer) 给的是 {'0':..,'1':..}，会把 PCM 摊成字节下标对象、
   // 甚至撑爆内存。「所有出口统一过 compact()」这条规矩必须对二进制安全。
   const buf = Buffer.from([0, 255, 128, 7])
@@ -39,6 +39,11 @@ test('compact 原样返回 Buffer / TypedArray（二进制不是可递归的普�
   assert.equal(Buffer.compare(out.pcm, buf), 0)
   const view = new Uint8Array([1, 2, 3])
   assert.equal(compact({ a: view }).a, view)
+  // ArrayBuffer 不是 view（`ArrayBuffer.isView` 为 false），必须单独命中第二个判断；
+  // 漏掉它就会被当成普通对象递归，摊成 {} 或字节下标对象。
+  const buf2 = new ArrayBuffer(4)
+  assert.equal(compact(buf2), buf2, 'compact 必须原样返回 ArrayBuffer')
+  assert.equal(compact({ a: buf2 }).a, buf2)
 })
 
 test('compact 不修改入参', () => {

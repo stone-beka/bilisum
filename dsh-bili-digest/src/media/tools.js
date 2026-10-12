@@ -59,10 +59,11 @@ const require = createRequire(import.meta.url)
  * 本机**没有任何 ffmpeg 二进制**（`E:\dsh\ffmpeg.dll` 是 Chromium 的，不是 CLI），所以这份
  * 随 npm tarball 分发、无 postinstall 下载的副本是「装完依赖即可用」的唯一保证。
  *
- * 它**刻意不参与 `resolveFfmpeg` 的两段查找**：那条链描述的是「用户可见的工具位置」
- * （`ffmpegPath` / `<cacheDir>/bin`），`checkTools` 按它报「工具未就位」；而这份副本会随
- * `node_modules` 重装消失，不能算「已就位」。它的用途只有一个：解码时在用户没指定
- * 工具位置的情况下兜底（见 `ffmpeg.js` 的 `resolveDecoderExe`）。
+ * 它**不参与 `resolveFfmpeg` 的两段查找**：那条链描述的是「用户可见的工具位置」
+ * （`ffmpegPath` / `<cacheDir>/bin`），语义保持 Task 6 原样。但「能不能解码」的判定
+ * 必须把这份副本算进去——否则 `checkTools` 会在它可用的机器上谎报 missing（见
+ * `resolveFfmpegExe`）。代价是这份副本会随 `node_modules` 重装消失，所以
+ * `installFfmpeg()` 仍建议把它复制进 `<cacheDir>/bin` 这个持久位置。
  */
 export function resolveBundledFfmpeg() {
   try {
@@ -76,7 +77,28 @@ export function resolveBundledFfmpeg() {
 }
 
 /**
+ * ffmpeg.exe 的**唯一**解析：两段查找（`ffmpegPath` → `<cacheDir>/bin`）→ 内置依赖副本。
+ *
+ * 为什么必须只有一个入口：`checkTools` 报的「工具未就位」与解码缝（`ffmpeg.js` 的
+ * `decodeToPcm`）实际用的 exe 一旦各写一份，就会出现「`checkTools().ffmpeg` 说有缺失、
+ * 但解码其实跑得动」的谎报；Task 20 的 doctor/闸门读的就是那个字段，会因此拒绝一条
+ * 本来能跑的流水线（Task 9 评审 F1）。两处共用本函数，字段与真实解码能力就不可能漂移。
+ *
+ * 语义细节：`config.ffmpegPath` 指向的文件不存在时**不再否决**内置副本——用户指错位置
+ * 而依赖里的副本可用时，我们照这份可用的副本解码，`checkTools` 也照实不报缺失。只有
+ * 两段查找与内置副本**都**落空时才返回 undefined，`FFMPEG_MISSING` 也只在该刻抛出。
+ *
+ * @returns 绝对路径或 undefined（两处都找不到）
+ */
+export function resolveFfmpegExe(config) {
+  return resolveFfmpeg(config) ?? resolveBundledFfmpeg()
+}
+
+/**
  * 返回缺失工具的问题描述；**无问题则不含该键**（键存在即有问题）。
+ *
+ * ffmpeg 走 `resolveFfmpegExe`（与解码缝同一条解析），所以「键缺席」严格等价于
+ * 「`decodeToPcm` 能解析到一个 exe」。
  * @returns {{ ytDlp?: string, ffmpeg?: string }}
  */
 export function checkTools(config) {
@@ -85,7 +107,7 @@ export function checkTools(config) {
   if (!resolveYtDlp(config)) {
     problems.ytDlp = `找不到 yt-dlp.exe。放置到 ${join(bin, YTDLP_EXE)}，或配置 ytDlpPath，或用 --update-tools 自动下载。`
   }
-  if (!resolveFfmpeg(config)) {
+  if (!resolveFfmpegExe(config)) {
     problems.ffmpeg = `找不到 ffmpeg.exe。放置到 ${join(bin, FFMPEG_EXE)}，或配置 ffmpegPath。`
   }
   return compact(problems)

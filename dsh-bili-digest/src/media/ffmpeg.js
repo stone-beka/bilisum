@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { cachePaths } from '../cache.js'
 import { BiliDigestError } from '../errors.js'
 import { compact } from '../json.js'
-import { childEnv, resolveBundledFfmpeg, resolveFfmpeg, spawnEnv } from './tools.js'
+import { childEnv, resolveBundledFfmpeg, resolveFfmpegExe, spawnEnv } from './tools.js'
 
 /** 平台目标 Windows x64。 */
 const FFMPEG_EXE = 'ffmpeg.exe'
@@ -23,8 +23,9 @@ const cancelled = () => new BiliDigestError('CANCELLED', '已取消')
  * 把内置依赖里的 ffmpeg.exe 复制到 `<cacheDir>/bin`。
  *
  * 为什么要有这一步（而不是直接跑 node_modules 里那份）：
- * 1. `checkTools` / `resolveFfmpeg` 的「工具就位」判定看的就是 `<cacheDir>/bin`，
- *    profile 里 `link:` 安装的插件目录随时可能被重装清空；
+ * 1. `<cacheDir>/bin` 是 `resolveFfmpeg` 两段查找里**持久**的那一段（也正是 `checkTools`
+ *    报缺失时指的位置）；profile 里 `link:` 安装的插件目录随时可能被重装清空，
+ *    而 `node_modules` 一旦消失，`resolveFfmpegExe` 的内置副本兜底会跟着一起失效；
  * 2. 本机没有系统 ffmpeg，这份副本是唯一可用的 CLI（`E:\dsh\ffmpeg.dll` 是 Chromium 的）。
  *
  * 幂等：目标已存在就直接返回。**落盘走「临时文件 + rename」**，避免半截的 61.5 MB
@@ -67,21 +68,8 @@ export async function installFfmpeg(config) {
 }
 
 /**
- * 解码用的 exe 解析。
- *
- * 顺序：`<cacheDir>/bin/ffmpeg.exe`（含显式 `ffmpegPath`，即 `resolveFfmpeg`）→ 内置依赖副本。
- * **内置副本只在用户没有显式配置 `ffmpegPath` 时启用**：用户指了位置就该尊重那个位置，
- * 指错时报 `FFMPEG_MISSING` 而不是悄悄换一份二进制跑（症状会晚很久才暴露）。
- *
- * `resolveFfmpeg` 自身保持 Task 6 的两段查找语义不变——`checkTools` 依赖它报「工具未就位」。
+ * ffmpeg 缺失的统一错误。hint 必须同时给出两条补救路径：ffmpegPath 配置、插件自己的 binDir。
  */
-function resolveDecoderExe(config) {
-  const exe = resolveFfmpeg(config)
-  if (exe) return exe
-  return config.ffmpegPath ? undefined : resolveBundledFfmpeg()
-}
-
-/** ffmpeg 缺失的统一错误。hint 必须同时给出两条补救路径：ffmpegPath 配置、插件自己的 binDir。 */
 function missingFfmpegError(config) {
   const bin = config.cacheDir ? cachePaths(config.cacheDir, '_').binDir : join('<cacheDir>', 'bin')
   const current = config.ffmpegPath ? `（当前配置：${config.ffmpegPath}，文件不存在）` : '（未配置）'
@@ -96,12 +84,18 @@ function missingFfmpegError(config) {
   )
 }
 
-/** 带上限的 stderr 累积器：满了就停止累积（末尾几行足够诊断，不必留全量噪声）。 */
+/**
+ * 带上限的 stderr 累积器：**保留最后 MAX_STDERR 个字符**（滑动窗口，超限就从头部丢）。
+ *
+ * 早期实现是「满了就停止累积」，留下的其实是**开头** 64 KB，而调用方按「末尾」诊断
+ * （ffmpeg 的失败原因永远在最后几行）——修的是行为，不是文案（Task 9 评审 F3）。
+ */
 function cappedStderr() {
   let text = ''
   return {
     push(chunk) {
-      if (text.length < MAX_STDERR) text += chunk
+      text += chunk
+      if (text.length > MAX_STDERR) text = text.slice(text.length - MAX_STDERR)
     },
     value() {
       return text
@@ -148,8 +142,14 @@ function buildDecodeArgs(inputPath) {
  * 换解码方案只改这里（规格 F12）。
  *
  * PCM 从 stdout 逐字节捕获、不落临时文件——所以没有「半截文件」需要清理，也就不需要
- * 临时文件 + rename。代价是整段音频驻留内存（16 kHz 单声道 ≈ 32 KB/s，4 小时 ≈ 460 MB，
- * 见规格 maxDurationSec 上限）；P0 接受这个量级，不额外引入磁盘往返。
+ * 临时文件 + rename。代价是整段音频驻留内存：16 kHz 单声道 ≈ 32 KB/s，4 小时
+ * （规格 `maxDurationSec = 14400 s`）的**载荷**是 14400 × 16000 × 2 B = 460.8 MB。
+ *
+ * 但**峰值不是载荷**：`Buffer.concat(chunks)` 在返回时把每一片再复制一份，而 `chunks`
+ * 数组（连同它的所有分片）此刻仍被引用着，所以 `decodeToPcm` 单独就会瞬时占用约 **2×
+ * ≈ 0.9 GB**；Task 10 的 `buildPcmWav` 再拼一份规范 WAV 头时还会多一份。P0 刻意保留
+ * 这个内存内设计（改成流式落临时文件会重新引入本契约要避免的「半截文件」窗口），
+ * **`maxDurationSec` 就是内存闸门**：调大它之前按 2 × 32 KB/s × 时长核算峰值。
  *
  * @param config 已解析配置（`resolveConfig()` 的结果）
  * @param inputPath 输入文件绝对路径
@@ -162,7 +162,9 @@ function buildDecodeArgs(inputPath) {
 export function decodeToPcm(config, inputPath, { signal, spawnImpl = defaultSpawn } = {}) {
   if (signal?.aborted) return Promise.reject(cancelled())
 
-  const exe = resolveDecoderExe(config)
+  // F1：与 checkTools 共用 tools.js 的 resolveFfmpegExe（两段查找 ?? 内置依赖副本）。
+  // 这里**不许**再写一份自己的解析——一旦漂移，checkTools().ffmpeg 就会谎报缺失。
+  const exe = resolveFfmpegExe(config)
   if (!exe) return Promise.reject(missingFfmpegError(config))
 
   let env
@@ -199,6 +201,10 @@ export function decodeToPcm(config, inputPath, { signal, spawnImpl = defaultSpaw
     }
     const cleanup = () => signal?.removeEventListener('abort', onAbort)
     signal?.addEventListener('abort', onAbort, { once: true })
+    // F4：addEventListener 不会补发「已经 abort 过」的事件——若中止正好落在函数开头的
+    // `signal?.aborted` 检查与这行注册之间，监听器永远不触发，子进程会一路跑到底
+    // （只在 close 时才被报成 CANCELLED）。这里补检一次，落在窗口里的中止立刻 kill。
+    if (signal?.aborted) onAbort()
 
     child.stdout.on('data', (chunk) => {
       chunks.push(chunk)
