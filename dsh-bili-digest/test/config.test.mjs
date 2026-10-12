@@ -1,7 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { resolveConfig } from '../src/config.js'
-import { BiliDigestError } from '../src/errors.js'
 
 test('空配置产出全部默认值', () => {
   const c = resolveConfig()
@@ -32,4 +31,21 @@ test('未知配置键被拒绝', () => {
 
 test('cacheDir 为空时由调用方补默认值，resolveConfig 不碰文件系统', () => {
   assert.equal(resolveConfig().cacheDir, '')
+})
+
+test('数字类配置拒绝数字字符串（YAML 里写 "30" 是常见笔误）', () => {
+  // 只做范围比较会漏掉这个：JS 里 '30' >= 30 为 true，字符串会被原样放行
+  for (const key of ['windowSeconds', 'snapSeconds', 'minSegmentSeconds', 'waitSeconds', 'maxDurationSec', 'maxKeyPoints']) {
+    assert.throws(() => resolveConfig({ [key]: '30' }), (e) => e.code === 'BAD_CONFIG', `${key} 不应接受字符串`)
+  }
+})
+
+test('maxKeyPoints 必须是整数', () => {
+  assert.throws(() => resolveConfig({ maxKeyPoints: 3.5 }), (e) => e.code === 'BAD_CONFIG')
+  assert.equal(resolveConfig({ maxKeyPoints: 5 }).maxKeyPoints, 5)
+})
+
+test('原型链上的键名不被当作已知配置项', () => {
+  // `key in DEFAULTS` 会走原型链，toString 之类会绕过未知键检查
+  assert.throws(() => resolveConfig({ toString: 1 }), (e) => e.code === 'BAD_CONFIG')
 })

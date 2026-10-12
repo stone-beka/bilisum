@@ -3,6 +3,11 @@ import { BiliDigestError } from './errors.js'
 const AUDIO_QUALITY = ['balanced', 'smallest', 'best']
 const LANGS = ['auto', 'zh', 'en', 'yue', 'ja', 'ko']
 
+/** 数字类配置的公共前置检查：必须是有限 number。
+ *  只做范围比较是不够的——`'30' >= 30` 在 JS 里成立，YAML 里手滑写成
+ *  `windowSeconds: "30"` 就会把字符串原样交给下游。 */
+const num = (v) => typeof v === 'number' && Number.isFinite(v)
+
 /** 每个字段的校验：返回 null 表示通过，否则返回中文问题描述。 */
 const VALIDATORS = {
   command: (v) => (/^[a-z][a-z0-9_-]*$/.test(v) ? null : '必须是小写字母开头的命令名'),
@@ -10,9 +15,9 @@ const VALIDATORS = {
   cacheDir: (v) => (typeof v === 'string' ? null : '必须是字符串'),
   language: (v) => (LANGS.includes(v) ? null : `必须是 ${LANGS.join('/')} 之一`),
   preferredSubtitleLang: (v) => (typeof v === 'string' ? null : '必须是字符串'),
-  windowSeconds: (v) => (v >= 30 && v <= 60 ? null : '必须是 30–60 之间的数字（上限 60 是实测结论，见规格 F19）'),
-  snapSeconds: (v) => (v >= 0 && v <= 5 ? null : '必须是 0–5 之间的数字'),
-  minSegmentSeconds: (v) => (v >= 1 && v <= 30 ? null : '必须是 1–30 之间的数字'),
+  windowSeconds: (v) => (num(v) && v >= 30 && v <= 60 ? null : '必须是 30–60 之间的数字（上限 60 是实测结论，见规格 F19）'),
+  snapSeconds: (v) => (num(v) && v >= 0 && v <= 5 ? null : '必须是 0–5 之间的数字'),
+  minSegmentSeconds: (v) => (num(v) && v >= 1 && v <= 30 ? null : '必须是 1–30 之间的数字'),
   audioQuality: (v) => (AUDIO_QUALITY.includes(v) ? null : `必须是 ${AUDIO_QUALITY.join('/')} 之一`),
   proxy: (v) => (typeof v === 'string' ? null : '必须是字符串：空串=直连，system=跟随系统，其它=代理 URL'),
   toolDownloadProxy: (v) => (typeof v === 'string' ? null : '必须是字符串'),
@@ -23,9 +28,9 @@ const VALIDATORS = {
     v && typeof v === 'object' && typeof v.provider === 'string' && typeof v.model === 'string'
       ? null
       : '必须是 { provider: string, model: string }',
-  waitSeconds: (v) => (v >= 0 && v <= 120 ? null : '必须是 0–120 之间的数字'),
-  maxDurationSec: (v) => (v >= 60 ? null : '必须 >= 60'),
-  maxKeyPoints: (v) => (v >= 3 && v <= 20 ? null : '必须是 3–20 之间的整数'),
+  waitSeconds: (v) => (num(v) && v >= 0 && v <= 120 ? null : '必须是 0–120 之间的数字'),
+  maxDurationSec: (v) => (num(v) && v >= 60 ? null : '必须是 >= 60 的数字'),
+  maxKeyPoints: (v) => (num(v) && Number.isInteger(v) && v >= 3 && v <= 20 ? null : '必须是 3–20 之间的整数'),
   keepTranscript: (v) => (typeof v === 'boolean' ? null : '必须是布尔值'),
 }
 
@@ -61,7 +66,7 @@ export function resolveConfig(raw = {}) {
     throw new BiliDigestError('BAD_CONFIG', '配置必须是一个对象', '检查 profile 的 cordis.patch.yml')
   }
   for (const key of Object.keys(raw)) {
-    if (!(key in DEFAULTS)) {
+    if (!Object.hasOwn(DEFAULTS, key)) {
       throw new BiliDigestError('BAD_CONFIG', `未知配置项：${key}`, `可用项：${Object.keys(DEFAULTS).join(', ')}`)
     }
   }
