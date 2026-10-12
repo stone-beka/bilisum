@@ -2034,7 +2034,20 @@ git commit -m "feat(bili-digest): yt-dlp 封装（probe/version + 失败分类�
 **Interfaces:**
 - Consumes: `resolveFfmpeg` / `childEnv`（Task 6）
 - Produces:
-  - `toWav16k(config, inputPath, outputPath, { signal }): Promise<void>` —— 非零退出抛 `AUDIO_DECODE_FAILED`；找不到 ffmpeg 抛 `FFMPEG_MISSING`
+  - `decodeToPcm(config, inputPath, { signal, spawnImpl }): Promise<{ pcm: Buffer, sampleRate: 16000, channels: 1, bitsPerSample: 16 }>` —— **裸 PCM，不带 WAV 头**；非零退出抛 `AUDIO_DECODE_FAILED`；找不到 ffmpeg 抛 `FFMPEG_MISSING`
+
+> **为什么本任务只产裸 PCM、不产 WAV（Task 9 实施后裁定）**
+>
+> 这条分工是实测逼出来的：**ffmpeg 自己的 WAV 输出不是规范的**——它会插入 `LIST`/`INFO`/`fact` chunk，同一份音频的 `data` 落在 offset 78 而不是 44。而 `ctx.speechToText` 对 WAV 做**逐字节**校验，只吃 44 字节头的规范 PCM16。所以"解码"和"造规范的 WAV 头"必须是两件事，后者归 Task 10 的 `buildPcmWav`。
+>
+> 本任务因此**不写 `paths.audioWav`**：它拿不出规范的头。管线（Task 19）把两者串起来：
+> ```js
+> const pcm = await decodeToPcm(config, paths.audioM4s, { signal })
+> await writeWavAtomic(paths.audioWav, buildPcmWav(pcm))   // buildPcmWav 来自 Task 10
+> ```
+> 这样 `paths.audioWav` 仍是可缓存的规范产物（Task 11/13/14 都按 `wavPath` 读盘），而 Task 9 不必依赖尚未存在的 Task 10（否则两个任务循环依赖）。
+>
+> 内存边界：16 kHz 单声道 16 bit = 32 KB/s，4 小时（`maxDurationSec` 默认 14400）≈ **460 MB** 常驻，写完盘即释放。可接受，但 `maxDurationSec` 就是这道闸门——想省内存就调小它。
   - `installFfmpeg(config): Promise<string>` —— 从 `@ffmpeg-installer/win32-x64` 复制到 `<cacheDir>/bin/ffmpeg.exe`
 
 - [ ] **Step 1: 装依赖并写失败测试**
@@ -2109,58 +2122,29 @@ export async function installFfmpeg(config) {
 }
 
 /**
- * m4s → 16kHz 单声道 PCM16 WAV。
+ * m4s → 16kHz 单声道 16bit **裸 PCM**（不带 WAV 头）。
  *
  * **这是唯一的解码点**：其它模块不得直接依赖 ffmpeg，换解码方案只改这里。
- * 注意产出的 WAV 不是「规范 WAV」——ffmpeg 会插入 LIST/fact chunk，
- * 所以 audio/window.js 必须自己解析 chunk 再重写规范头（规格 F7）。
+ *
+ * 为什么不直接产 WAV：ffmpeg 的 WAV 会插入 LIST/INFO/fact chunk（实测同一份
+ * 音频的 data 落在 offset 78 而不是 44），而 ctx.speechToText 对 WAV 做逐字节
+ * 校验，只吃 44 字节头的规范 PCM16。规范头由 Task 10 的 buildPcmWav 补，管线
+ * 在 Task 19 把两者串起来。
+ *
+ * 输出走 stdout（`-f s16le pipe:1`），不落临时文件，因此没有半截文件要清理。
  */
-export function toWav16k(config, inputPath, outputPath, { signal } = {}) {
-  const exe = resolveFfmpeg(config)
-  if (!exe) {
-    return Promise.reject(new BiliDigestError('FFMPEG_MISSING', '找不到 ffmpeg.exe', `运行 installFfmpeg()，或配置 ffmpegPath。`))
-  }
-  const args = [
-    '-hide_banner', '-nostdin', '-loglevel', 'error', '-y',
-    '-i', inputPath,
-    '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
-    '-f', 'wav', outputPath,
-  ]
-  return new Promise((resolve, reject) => {
-    const child = spawn(exe, args, {
-      env: spawnEnv(childEnv(config, 'bilibili')),
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    let err = ''
-    const onAbort = () => {
-      // Windows 上 kill() 不一定带走子进程树，用 taskkill 兜底
-      try { child.kill() } catch { /* 忽略 */ }
-      try {
-        spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
-      } catch { /* 忽略 */ }
-    }
-    signal?.addEventListener('abort', onAbort, { once: true })
-    child.stderr.on('data', (d) => { if (err.length < 65536) err += d.toString() })
-    child.on('error', (e) => {
-      signal?.removeEventListener('abort', onAbort)
-      reject(new BiliDigestError('AUDIO_DECODE_FAILED', `无法启动 ffmpeg：${e.message}`, undefined, e))
-    })
-    child.on('close', (code) => {
-      signal?.removeEventListener('abort', onAbort)
-      if (signal?.aborted) {
-        reject(new BiliDigestError('CANCELLED', '已取消'))
-        return
-      }
-      if (code !== 0) {
-        reject(new BiliDigestError('AUDIO_DECODE_FAILED', 'ffmpeg 解码失败', `ffmpeg 输出（末尾）：\n${err.split(/\r?\n/).slice(-20).join('\n')}`))
-        return
-      }
-      resolve()
-    })
-  })
-}
+export function decodeToPcm(config, inputPath, { signal, spawnImpl = defaultSpawn } = {})
 ```
+
+> **实现已落地**，见 `dsh-bili-digest/src/media/ffmpeg.js` 的 `decodeToPcm` 与 `installFfmpeg`。
+> 关键点（均已实现并有测试/实测证据）：
+> - 参数含 `-hide_banner -nostdin`：**`-nostdin` 是必需的**，否则 ffmpeg 可能吃掉父进程的 stdin 而挂住。
+> - `-vn -ac 1 -ar 16000 -c:a pcm_s16le -f s16le pipe:1`：强制 16k/单声道/16bit，采样率不交给 ffmpeg 默认值。
+> - `installFfmpeg(config)`：把依赖包里的 `ffmpeg.exe` 复制到 `<cacheDir>/bin/`，已存在则直接复用。
+> - 裸 PCM 契约的实测依据：同一二进制自产 WAV 的 `data` 落在 offset **78**（含 `LIST/INFO`），而 1.5s → 48000 B、2.0s → 64000 B，恒为 32000 B/s。
+> - **`compact()` 必须放过 Buffer**：`Object.entries(Buffer)` 会给出 `{0:..,1:..}`，把几 MB 的 PCM 摊成几千万个键。`src/json.js` 已加 `ArrayBuffer.isView(value) || value instanceof ArrayBuffer` 的原样返回分支。
+>
+> *（此处的 50 行实现片段已删除：代码已提交，在计划里重复一份只会与仓库漂移。)*
 
 - [ ] **Step 4: 跑测试确认通过并提交**
 
@@ -2996,7 +2980,7 @@ git commit -m "feat(bili-digest): ctx.speechToText 适配（逐片串行转写�
 - Create: `test/asr-select.test.mjs`
 
 **Interfaces:**
-- Consumes: `getService` / `pickProvider` / `ensureReady` / `transcribeClips`（Task 13）、`planSegments`（Task 11）、`resolveFfmpeg`（Task 6）、`toWav16k`（Task 9）、`downloadAudio`（Task 12）、`parsePcmWav`（Task 10）
+- Consumes: `getService` / `pickProvider` / `ensureReady` / `transcribeClips`（Task 13）、`planSegments`（Task 11）、`resolveFfmpeg`（Task 6）、`decodeToPcm`（Task 9）、`downloadAudio`（Task 12）、`parsePcmWav`（Task 10）
 - Produces:
   - `transcribeAll(ctx, config, { probe, audioPath, wavPath, language }, onProgress, signal): Promise<Transcript>`，其中 `Transcript = { source:'subtitle'|'local', precision:'sentence'|'window', language, segments, chapters, notes:string[] }`
   - `LOCAL_WINDOW_PRECISION = 'window'`
@@ -4362,7 +4346,7 @@ Expected: FAIL —— 模块不存在
 `src/pipeline.js`：
 
 ```js
-import { appendFile, mkdir, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, rename, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { BiliDigestError } from './errors.js'
@@ -4370,7 +4354,8 @@ import { cachePaths, readJson, writeJsonAtomic } from './cache.js'
 import { normalizeUrl } from './media/url.js'
 import { checkTools, downloadYtDlp, resolveFfmpeg } from './media/tools.js'
 import { downloadAudio, probe } from './media/ytdlp.js'
-import { installFfmpeg, toWav16k } from './media/ffmpeg.js'
+import { decodeToPcm, installFfmpeg } from './media/ffmpeg.js'
+import { buildPcmWav } from './audio/window.js'
 import { transcribeAll } from './asr/index.js'
 import { assemble } from './evidence.js'
 import { validateDigest } from './digest/validate.js'
@@ -4478,9 +4463,17 @@ export async function runPipeline(ctx, config, job, options = {}, signal) {
       await downloadAudio(config, url, paths.audioM4s, { signal, onProgress: (p) => emit('audio', `${p.phase}${p.done ? ' 完成' : ''}`) })
     }
     // ---- decode ----
+    // 两步：decodeToPcm 出裸 PCM（Task 9），buildPcmWav 补规范的 44 字节头（Task 10）。
+    // 不能让 ffmpeg 直接写 WAV——它的头不规范（LIST/fact chunk、data 在 offset 78），
+    // 而 ctx.speechToText 对 WAV 做逐字节校验，会直接拒收。
     emit('decode', '转 16kHz 单声道 WAV')
     if (refresh || !existsSync(paths.audioWav)) {
-      await toWav16k(config, paths.audioM4s, paths.audioWav, { signal })
+      const { pcm } = await decodeToPcm(config, paths.audioM4s, { signal })
+      // 零拷贝视图：buildPcmWav 要 Int16Array，用同一块内存避免 460MB 级别的复制。
+      const samples = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2))
+      const tmpWav = `${paths.audioWav}.tmp-${process.pid}`
+      await writeFile(tmpWav, Buffer.from(buildPcmWav(samples, 16000)))
+      await rename(tmpWav, paths.audioWav)
     }
     // ---- window + transcribe ----
     transcript = await transcribeAll(
