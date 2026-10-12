@@ -1292,6 +1292,29 @@ git commit -m "feat(bili-digest): URL 归一化与域名白名单"
   - `checkTools(config): { ytDlp?: string, ffmpeg?: string }` —— 值为问题描述，无问题则不出现该键
   - `childEnv(config, target): object` —— `target` 为 `'bilibili'` 或 `'tool-download'`
   - `ensureTmpDir(config): Promise<string>`
+  - `proxyArg(policy): string[]` —— 把代理**策略**翻译成 yt-dlp 参数片段
+  - `spawnEnv(env): object` —— 去掉 `childEnv` 结果里的 `__proxy` 载体字段
+
+**`proxyArg` 存在的原因（Task 6 实施者发现的接口陷阱）**：`childEnv` 返回的 `__proxy` 是**策略值**——`''`/`'direct'` 表示强制直连，`'system'` 表示跟随系统——**不是 URL**。后续任务若字面照抄 `--proxy=${__proxy}`，当 `proxy: 'system'` 时会产出非法的 `--proxy=system`。
+
+```js
+/**
+ * 把代理策略翻译成 yt-dlp 的 `--proxy` 参数。
+ *
+ * 策略值不是 URL：`''`/`'direct'`=强制直连，`'system'`=跟随系统。
+ * 直接拼进 `--proxy=` 会产生非法的 `--proxy=system`。
+ *
+ * @returns 要展开进参数数组的片段：
+ *   直连 → `['--proxy=']`（空值即让 yt-dlp 不走代理）
+ *   跟随系统 → `[]`（**不传这个参数**，yt-dlp 才会去读系统代理）
+ *   显式代理 → `['--proxy=<url>']`
+ */
+export function proxyArg(policy) {
+  if (policy === undefined || policy === null || policy === '' || policy === 'direct') return ['--proxy=']
+  if (policy === 'system') return []
+  return [`--proxy=${policy}`]
+}
+```
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1792,6 +1815,16 @@ test('buildProbeArgs 含离线与静默标志，且带 --proxy', () => {
   assert.equal(args.at(-1), 'https://x/video/BV1')
 })
 
+test('proxy 策略为 system 时完全不传 --proxy（否则会变成非法的 --proxy=system）', () => {
+  const args = buildProbeArgs('https://x', '', 'system')
+  assert.ok(!args.some((a) => a.startsWith('--proxy')), 'system 策略必须靠"不传参数"来生效')
+})
+
+test('proxy 策略为显式 URL 时传 --proxy=<url>', () => {
+  const args = buildProbeArgs('https://x', '', 'http://127.0.0.1:1080')
+  assert.ok(args.includes('--proxy=http://127.0.0.1:1080'))
+})
+
 test('buildProbeArgs 带 cookie 文件时追加 --cookies', () => {
   const args = buildProbeArgs('https://x', 'C:/tmp/c.txt')
   assert.ok(args.includes('--cookies'))
@@ -1826,7 +1859,7 @@ Expected: FAIL —— 模块不存在
 ```js
 import { spawn } from 'node:child_process'
 import { BiliDigestError } from '../errors.js'
-import { childEnv, ensureTmpDir, resolveYtDlp, spawnEnv } from './tools.js'
+import { childEnv, ensureTmpDir, proxyArg, resolveYtDlp, spawnEnv } from './tools.js'
 
 const MAX_BUFFER = 64 * 1024 * 1024
 
@@ -1895,14 +1928,15 @@ export function runYtDlp(config, args, { signal } = {}) {
   })
 }
 
-/** 构造 probe 的参数。 */
-export function buildProbeArgs(url, cookieFile, proxy = '') {
+/** 构造 probe 的参数。`proxyPolicy` 是策略值（'' / 'direct' / 'system' / URL），
+ *  由 proxyArg 翻译——直接拼 `--proxy=${policy}` 会产出非法的 `--proxy=system`。 */
+export function buildProbeArgs(url, cookieFile, proxyPolicy = '') {
   const args = [
     '--dump-single-json',
     '--skip-download',
     '--no-playlist',
     '--no-warnings',
-    `--proxy=${proxy}`,
+    ...proxyArg(proxyPolicy),
   ]
   if (cookieFile) args.push('--cookies', cookieFile)
   args.push(url)
@@ -2613,22 +2647,27 @@ test('AUDIO_FORMAT_ID 三个档位映射到实测到的 format_id', () => {
 })
 
 test('buildAudioArgs 使用显式 format_id 而不是 bestaudio', () => {
-  const args = buildAudioArgs('https://x/video/BV1', { formatId: '30232', destTemplate: 'C:/t/a.%(ext)s', proxy: '' })
+  const args = buildAudioArgs('https://x/video/BV1', { formatId: '30232', destTemplate: 'C:/t/a.%(ext)s', proxyPolicy: '' })
   assert.ok(args.includes('-f'))
   assert.ok(args.includes('30232'))
   assert.ok(!args.some((a) => a.includes('bestaudio')))
 })
 
-test('buildAudioArgs 带代理与输出模板，URL 在最后', () => {
-  const args = buildAudioArgs('https://x/video/BV1', { formatId: '30216', destTemplate: 'C:/t/a.%(ext)s', proxy: 'http://p:1' })
+test('buildAudioArgs 带显式代理与输出模板，URL 在最后', () => {
+  const args = buildAudioArgs('https://x/video/BV1', { formatId: '30216', destTemplate: 'C:/t/a.%(ext)s', proxyPolicy: 'http://p:1' })
   assert.ok(args.includes('--proxy=http://p:1'))
   assert.ok(args.includes('-o'))
   assert.ok(args.includes('C:/t/a.%(ext)s'))
   assert.equal(args.at(-1), 'https://x/video/BV1')
 })
 
+test('buildAudioArgs 在 system 策略下不传 --proxy', () => {
+  const args = buildAudioArgs('https://x', { formatId: '30232', destTemplate: 'd', proxyPolicy: 'system' })
+  assert.ok(!args.some((a) => a.startsWith('--proxy')))
+})
+
 test('buildAudioArgs 带 cookie 文件', () => {
-  const args = buildAudioArgs('https://x', { formatId: '30232', destTemplate: 'd', cookieFile: 'C:/c.txt', proxy: '' })
+  const args = buildAudioArgs('https://x', { formatId: '30232', destTemplate: 'd', cookieFile: 'C:/c.txt', proxyPolicy: '' })
   assert.ok(args.includes('--cookies'))
   assert.ok(args.includes('C:/c.txt'))
 })
@@ -2646,6 +2685,7 @@ Expected: FAIL —— `AUDIO_FORMAT_ID is not defined`
 ```js
 import { readdir, rename, stat } from 'node:fs/promises'
 import { basename, dirname, extname, join } from 'node:path'
+import { proxyArg } from './tools.js'
 ```
 
 ```js
@@ -2656,13 +2696,13 @@ export const AUDIO_FORMAT_ID = {
   best: '30280',     // AAC-LC 204 kbps
 }
 
-export function buildAudioArgs(url, { formatId, destTemplate, cookieFile, proxy = '' }) {
+export function buildAudioArgs(url, { formatId, destTemplate, cookieFile, proxyPolicy = '' }) {
   const args = [
     '-f', formatId,
     '--no-playlist',
     '--no-warnings',
     '--no-progress',
-    `--proxy=${proxy}`,
+    ...proxyArg(proxyPolicy),
     '-o', destTemplate,
   ]
   if (cookieFile) args.push('--cookies', cookieFile)
@@ -2683,7 +2723,7 @@ export async function downloadAudio(config, url, destPath, { cookieFile, signal,
   const template = join(destDir, `${stem}.%(ext)s`)
 
   onProgress?.({ phase: 'audio', formatId })
-  await runYtDlp(config, buildAudioArgs(url, { formatId, destTemplate: template, cookieFile, proxy }), { signal })
+  await runYtDlp(config, buildAudioArgs(url, { formatId, destTemplate: template, cookieFile, proxyPolicy: proxy }), { signal })
 
   // 找到 yt-dlp 实际写出的文件（扩展名可能是 m4a/webm）
   const entries = await readdir(destDir).catch(() => [])
