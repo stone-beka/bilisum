@@ -5,10 +5,22 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { parseSums, downloadYtDlp, YTDLP_MIRRORS } from '../src/media/tools.js'
+import {
+  parseSums,
+  downloadYtDlp,
+  YTDLP_MIRRORS,
+  YTDLP_TAG,
+  YTDLP_SHA256,
+} from '../src/media/tools.js'
 import { resolveConfig } from '../src/config.js'
 
 const SUMS = `abc123  yt-dlp.exe\ndef456  yt-dlp.tar.gz\n`
+
+const sha256 = (data) => createHash('sha256').update(data).digest('hex')
+
+/** 把信任锚钉到 `data` 上的配置；tag 与 sha256 必须成对（配置层强制）。 */
+const pinnedCfg = (cacheDir, data) =>
+  resolveConfig({ cacheDir, ytDlpTag: YTDLP_TAG, ytDlpSha256: sha256(data) })
 
 test('parseSums 解析文件名到哈希', () => {
   const m = parseSums(SUMS)
@@ -22,22 +34,24 @@ test('镜像链至少三个且以官方直连结尾', () => {
   assert.match(list.at(-1), /^https:\/\/github\.com\//)
 })
 
+test('内置信任锚是 2026.08.19 的 64 位十六进制哈希（信任只来自源码）', () => {
+  assert.equal(YTDLP_TAG, '2026.08.19')
+  assert.match(YTDLP_SHA256, /^[0-9a-f]{64}$/)
+})
+
 test('下载内容 SHA-256 不符时换下一个镜像', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dl-'))
-  const cfg = resolveConfig({ cacheDir: dir })
   const real = Buffer.from('the real binary')
-  const realHash = createHash('sha256').update(real).digest('hex')
-  let calls = 0
+  const cfg = pinnedCfg(dir, real)
+  let exeCalls = 0
   const fetchImpl = async (url) => {
-    calls += 1
-    if (url.endsWith('SHA2-256SUMS')) {
-      return { ok: true, arrayBuffer: async () => new TextEncoder().encode(`bad000  yt-dlp.exe\n${realHash}  yt-dlp.exe\n`).buffer }
-    }
+    if (url.endsWith('SHA2-256SUMS')) return bytesResponse(`bad000  yt-dlp.exe\n${sha256(real)}  yt-dlp.exe\n`)
+    exeCalls += 1
     // 第一个镜像给错内容，第二个给对内容
-    const body = calls <= 2 ? Buffer.from('corrupted') : real
-    return { ok: true, arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) }
+    return bytesResponse(exeCalls === 1 ? 'corrupted' : real)
   }
   const dest = await downloadYtDlp(cfg, { fetchImpl })
+  assert.equal(exeCalls, 2, '第一个镜像内容不符后必须换第二个镜像')
   assert.equal(await readFile(dest, 'utf8'), 'the real binary')
   await rm(dir, { recursive: true, force: true })
 })
@@ -65,8 +79,6 @@ async function withDir(fn) {
   }
 }
 
-const sha256 = (data) => createHash('sha256').update(data).digest('hex')
-
 /** 造一个 fetch 替身响应；arrayBuffer 要按 byteOffset 切片——
  *  Buffer.from 常从小对象池里切，直接给 buf.buffer 会多带前一个 Buffer 的字节。 */
 function bytesResponse(data) {
@@ -80,7 +92,7 @@ function bytesResponse(data) {
 
 test('校验失败的镜像不留任何文件，成功的是第二个镜像', async () => {
   await withDir(async (dir) => {
-    const cfg = resolveConfig({ cacheDir: dir })
+    const cfg = pinnedCfg(dir, 'the real binary')
     const mirrors = YTDLP_MIRRORS()
     const real = Buffer.from('the real binary')
     const exeUrls = []
@@ -112,7 +124,7 @@ test('校验失败的镜像不留任何文件，成功的是第二个镜像', as
     const done = events.at(-1)
     assert.equal(done.done, true)
     assert.equal(done.bytes, real.length)
-    assert.equal(done.verified, true)
+    assert.equal(done.verified, true, '成功安装必然已通过信任锚比对')
     assert.ok(
       events.slice(0, -1).every((e) => e.done === undefined),
       '尝试中的事件不能提前报 done',
@@ -122,14 +134,16 @@ test('校验失败的镜像不留任何文件，成功的是第二个镜像', as
 
 test('全部镜像内容都不符时拒绝，且 bin 里不留任何文件（含 .tmp-*）', async () => {
   await withDir(async (dir) => {
-    const cfg = resolveConfig({ cacheDir: dir })
-    const expected = sha256('expected content')
+    const cfg = resolveConfig({ cacheDir: dir }) // 信任锚 = 内置 pin
+    const mirrorHash = sha256('expected content') // 镜像上的哈希 ≠ 内置 pin
     const fetchImpl = async (url) =>
-      url.endsWith('SHA2-256SUMS') ? bytesResponse(`${expected}  yt-dlp.exe\n`) : bytesResponse('corrupted')
+      url.endsWith('SHA2-256SUMS') ? bytesResponse(`${mirrorHash}  yt-dlp.exe\n`) : bytesResponse('corrupted')
 
-    await assert.rejects(
-      () => downloadYtDlp(cfg, { fetchImpl }),
-      (err) => err.code === 'YTDLP_DOWNLOAD_FAILED',
+    const err = await downloadYtDlp(cfg, { fetchImpl }).catch((e) => e)
+    assert.equal(err.code, 'YTDLP_DOWNLOAD_FAILED')
+    assert.ok(
+      err.hint.includes('官方哈希已变更') && err.hint.includes(YTDLP_SHA256) && err.hint.includes(mirrorHash),
+      '诊断要能区分「pin 过期」：期望与实际都要写进 hint',
     )
 
     const left = await readdir(dir, { recursive: true })
@@ -149,7 +163,7 @@ test('全部镜像内容都不符时拒绝，且 bin 里不留任何文件（含
 
 test('镜像 HTTP 500 时换下一个镜像', async () => {
   await withDir(async (dir) => {
-    const cfg = resolveConfig({ cacheDir: dir })
+    const cfg = pinnedCfg(dir, 'ok binary')
     const mirrors = YTDLP_MIRRORS()
     const real = Buffer.from('ok binary')
     const seen = []
@@ -168,7 +182,7 @@ test('镜像 HTTP 500 时换下一个镜像', async () => {
 
 test('就位失败时清掉临时文件并继续下一个镜像', async () => {
   await withDir(async (dir) => {
-    const cfg = resolveConfig({ cacheDir: dir })
+    const cfg = pinnedCfg(dir, 'ok binary')
     const real = Buffer.from('ok binary')
     // 把最终路径先占成目录：Windows 上 rename(file → 已存在目录) 抛 EPERM，
     // 用来复现「内容已校验、却在就位那一步失败」这条路径。
@@ -193,7 +207,7 @@ test('就位失败时清掉临时文件并继续下一个镜像', async () => {
 
 test('最终路径已有只读成品时，失败的下载不改动它也不留临时文件', async () => {
   await withDir(async (dir) => {
-    const cfg = resolveConfig({ cacheDir: dir })
+    const cfg = pinnedCfg(dir, 'ok binary')
     const dest = join(dir, 'bin', 'yt-dlp.exe')
     mkdirSync(join(dir, 'bin'), { recursive: true })
     writeFileSync(dest, 'ORIGINAL-BINARY')
@@ -222,12 +236,11 @@ test('最终路径已有只读成品时，失败的下载不改动它也不留�
 
 test('中途被中止时抛中止原因，不当作镜像失败继续重试', async () => {
   await withDir(async (dir) => {
-    const cfg = resolveConfig({ cacheDir: dir })
+    const cfg = pinnedCfg(dir, 'x')
     const ac = new AbortController()
     let calls = 0
-    const fetchImpl = async (url) => {
+    const fetchImpl = async () => {
       calls += 1
-      if (url.endsWith('SHA2-256SUMS')) return bytesResponse(`${sha256('x')}  yt-dlp.exe\n`)
       ac.abort()
       throw Object.assign(new Error('aborted'), { name: 'AbortError' })
     }
@@ -235,21 +248,53 @@ test('中途被中止时抛中止原因，不当作镜像失败继续重试', as
       () => downloadYtDlp(cfg, { fetchImpl, signal: ac.signal }),
       (err) => err.name === 'AbortError',
     )
-    assert.equal(calls, 2, '中止之后不该再试后面的镜像')
+    assert.equal(calls, 1, '中止之后不该再试后面的镜像')
   })
 })
 
-test('SHA2-256SUMS 拿不到时不致命：不校验照样下载，但以 verified:false 明确上报', async () => {
+test('镜像上的 SHA2-256SUMS 拿不到时，也绝不安装未经比对的二进制', async () => {
   await withDir(async (dir) => {
-    const cfg = resolveConfig({ cacheDir: dir })
-    const events = []
+    const cfg = resolveConfig({ cacheDir: dir }) // 信任锚 = 内置 pin
     const fetchImpl = async (url) =>
       url.endsWith('SHA2-256SUMS') ? { ok: false, status: 404 } : bytesResponse('unverified binary')
-    const dest = await downloadYtDlp(cfg, { fetchImpl, onProgress: (e) => events.push(e) })
-    assert.equal(await readFile(dest, 'utf8'), 'unverified binary')
-    const done = events.at(-1)
-    assert.equal(done.verified, false, '没有校验源时必须自曝其短，不能假装校验过了')
-    assert.match(done.note, /SHA2-256SUMS/)
+
+    const err = await downloadYtDlp(cfg, { fetchImpl }).catch((e) => e)
+    assert.equal(err.code, 'YTDLP_DOWNLOAD_FAILED', '不匹配信任锚就不装，绝不降级为「未校验安装」')
+    assert.equal(existsSync(join(dir, 'bin', 'yt-dlp.exe')), false)
+    assert.deepEqual(await readdir(join(dir, 'bin')), [])
+    assert.ok(err.hint.includes('404'), '诊断要把 SUMS 的失败原因带出来')
+  })
+})
+
+test('SUMS 与 pin 一致也不能放行哈希不符的字节（SUMS 不参与信任判定）', async () => {
+  await withDir(async (dir) => {
+    const pin = sha256('expected content')
+    const cfg = resolveConfig({ cacheDir: dir, ytDlpTag: YTDLP_TAG, ytDlpSha256: pin })
+    const fetchImpl = async (url) =>
+      url.endsWith('SHA2-256SUMS') ? bytesResponse(`${pin}  yt-dlp.exe\n`) : bytesResponse('corrupted')
+
+    const err = await downloadYtDlp(cfg, { fetchImpl }).catch((e) => e)
+    assert.equal(err.code, 'YTDLP_DOWNLOAD_FAILED')
+    assert.equal(existsSync(join(dir, 'bin', 'yt-dlp.exe')), false, '镜像上 SUMS 说什么都不作数')
+    assert.ok(!err.hint.includes('官方哈希已变更'), 'SUMS 与 pin 一致时不该报「pin 过期」')
+    assert.ok(err.hint.includes('与信任锚一致'), '诊断要指出失败在可达性/内容而非 pin')
+  })
+})
+
+test('signal 透传给 fetchImpl 的第二个参数（cancel 才能打断响应体传输）', async () => {
+  await withDir(async (dir) => {
+    const real = Buffer.from('ok binary')
+    const cfg = pinnedCfg(dir, real)
+    const ac = new AbortController()
+    const seen = []
+    const fetchImpl = async (url, opts) => {
+      seen.push(opts)
+      return bytesResponse(real)
+    }
+    const dest = await downloadYtDlp(cfg, { fetchImpl, signal: ac.signal })
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0]?.signal, ac.signal)
+    assert.equal(await readFile(dest, 'utf8'), 'ok binary')
   })
 })
 
@@ -263,7 +308,8 @@ test('全部失败时 hint 列出每个镜像、失败原因与手工放置路�
       assert.ok(err.hint.includes(url), `hint 必须列出镜像 ${url}`)
     }
     assert.ok(err.hint.includes('503'), 'hint 必须带上失败原因')
-    assert.ok(err.hint.includes('SHA2-256SUMS'), '拿不到校验和也要说出来')
+    assert.ok(err.hint.includes('SHA2-256SUMS'), '拿不到诊断用的校验和也要说出来')
+    assert.ok(err.hint.includes(YTDLP_SHA256), 'hint 必须写清本次用的信任锚')
     assert.ok(err.hint.includes(join(dir, 'bin', 'yt-dlp.exe')), 'hint 必须给出手工放置路径')
   })
 })

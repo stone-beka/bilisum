@@ -183,8 +183,11 @@ export function proxyArg(policy) {
 
 // ---------- yt-dlp 下载：镜像链 + SHA-256 校验 ----------
 
-/** 下载的 yt-dlp 版本。镜像链与 SHA2-256SUMS 必须是同一份 release。 */
-const YTDLP_TAG = '2026.08.19'
+/** 内置固定版本。追新版本走 config.ytDlpTag/ytDlpSha256（必须成对）。 */
+export const YTDLP_TAG = '2026.08.19'
+
+/** 该版本 yt-dlp.exe 的官方 SHA-256——**信任锚**，镜像无权定义它。 */
+export const YTDLP_SHA256 = '66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a'
 
 /** 官方校验和文件名。 */
 const YTDLP_SUMS = 'SHA2-256SUMS'
@@ -208,7 +211,7 @@ export function YTDLP_MIRRORS(tag = YTDLP_TAG) {
   ]
 }
 
-/** 校验和文件同样走镜像链（它也是 release 资产），顺序与二进制一致。 */
+/** 校验和文件的镜像链（顺序同二进制）。它**只用于失败诊断**，不承载信任。 */
 function sumsUrls(tag = YTDLP_TAG) {
   return YTDLP_MIRRORS(tag).map((url) => url.replace(/\/yt-dlp\.exe$/, `/${YTDLP_SUMS}`))
 }
@@ -239,18 +242,10 @@ function sha256(buf) {
 /** 完整哈希太长，错误消息里只取足以区分的前缀。 */
 const shortHash = (hex) => `${hex.slice(0, 12)}…`
 
-/** 主机名；非法 URL 原样返回，免得错误消息里只剩一个空串。 */
-function hostOf(url) {
-  try {
-    return new URL(url).host
-  } catch {
-    return url
-  }
-}
-
-/** 取一个 URL 的全部字节；非 2xx 直接抛，交给调用方换下一个镜像。 */
-async function fetchBytes(fetchImpl, url) {
-  const res = await fetchImpl(url)
+/** 取一个 URL 的全部字节；非 2xx 直接抛，交给调用方换下一个镜像。
+ *  `signal` 必须透传给 fetch：否则 job.cancel() 拦不住正在传输的 ~30MB 响应体。 */
+async function fetchBytes(fetchImpl, url, signal) {
+  const res = await fetchImpl(url, { signal })
   if (!res.ok) throw new Error(`HTTP ${res.status ?? '?'}`)
   return Buffer.from(await res.arrayBuffer())
 }
@@ -258,24 +253,58 @@ async function fetchBytes(fetchImpl, url) {
 const errorText = (err) => (err instanceof Error ? err.message : String(err))
 
 /**
- * 从镜像链下载 yt-dlp.exe，逐个镜像校验 SHA-256，第一个通过的胜出。
+ * 失败路径上的**诊断**：取一次 SHA2-256SUMS，只用来区分「pin 过期」与「镜像不通」。
+ *
+ * 它的结果**绝不参与安装决策**。正因如此，这里可以放心走镜像链：SUMS 与二进制
+ * 同样是 release 资产，恶意镜像顶多把诊断文案改坏，改不动「装什么字节」——那个
+ * 判定只认 config / 源码里的信任锚（见 downloadYtDlp）。
+ *
+ * @returns {{ note: string, failures: string[] }} note 为空串表示没得出诊断结论
+ */
+async function diagnoseSums(fetchImpl, tag, expected, signal) {
+  const failures = []
+  for (const url of sumsUrls(tag)) {
+    signal?.throwIfAborted()
+    try {
+      const got = parseSums((await fetchBytes(fetchImpl, url, signal)).toString('utf8')).get(YTDLP_EXE)
+      if (!got) {
+        failures.push(`${url}：文件里没有 ${YTDLP_EXE} 的哈希`)
+        continue
+      }
+      return got === expected
+        ? { note: `镜像上的 ${YTDLP_SUMS} 与信任锚一致（${shortHash(expected)}），失败在可达性而非内容`, failures: [] }
+        : { note: `官方哈希已变更（期望 ${expected}，实际 ${got}），插件需要更新`, failures: [] }
+    } catch (err) {
+      signal?.throwIfAborted()
+      failures.push(`${url}：${errorText(err)}`)
+    }
+  }
+  return { note: '', failures }
+}
+
+/**
+ * 从镜像链下载 yt-dlp.exe，逐个镜像与**信任锚**比对 SHA-256，第一个通过的胜出。
+ *
+ * 信任模型（本函数存在的理由）：
+ * - **镜像只提供字节，不提供信任。** 期望摘要只从 `config.ytDlpSha256` 或源码常量
+ *   `YTDLP_SHA256` 取；镜像链上的 SHA2-256SUMS **不参与安装判定**（它只在全部失败后
+ *   用于文案诊断）。所以恶意镜像既换不掉判定，也换不掉被装进去的字节。
+ * - **没有信任锚就不装**：取不到期望摘要直接失败，绝不降级成「未校验先装上」。
+ *   每条成功路径都必然比对通过，因此成功安装一定是已认证的。
  *
  * 三条硬规则：
- * 1. **校验不通过就是这个镜像失败，换下一个**——绝不把可疑二进制写进最终路径。
- *    校验在内存里做完，落盘走「临时文件 + rename」，所以最终路径上只会出现
- *    已校验的文件（或明确标记为未校验的，见第 3 条）。
+ * 1. **摘要不符就是这个镜像失败，换下一个**——可疑字节只留在内存里，不会写进最终路径。
  * 2. **临时文件在失败路径上一定清掉**：Windows 上 rename 会被 AV/索引器占用而抛
  *    EPERM/EACCES，不清就会在 bin 目录里留一地 .tmp-* 垃圾。
- * 3. **拿不到 SHA2-256SUMS 不致命**：能下到镜像却取不到校验和，不该把用户卡死；
- *    但必须自曝其短——成功事件带 `verified:false` 与原因，不能假装校验过了。
+ * 3. **落盘走「临时文件 + rename」**，最终路径上只会出现已通过比对的文件。
  *
- * @param config 已解析配置（需要 config.cacheDir）
+ * @param config 已解析配置（需要 config.cacheDir；可选成对的 config.ytDlpTag/ytDlpSha256）
  * @param options.fetchImpl 注入点，默认全局 fetch（全部单测离线跑）
  * @param options.onProgress 进度回调：每次尝试前 `{ phase, url }`，成功后
- *        `{ phase, url, done:true, bytes, verified }`，供 run.log 落盘
+ *        `{ phase, url, done:true, bytes, verified:true }`，供 run.log 落盘
  * @param options.signal 取消信号；中止时抛中止原因，**不**吞成 YTDLP_DOWNLOAD_FAILED
  * @returns 落位后的绝对路径
- * @throws BiliDigestError BAD_CONFIG（cacheDir 未配置）/ YTDLP_DOWNLOAD_FAILED（全部镜像失败）
+ * @throws BiliDigestError BAD_CONFIG（cacheDir 未配置）/ YTDLP_DOWNLOAD_FAILED（无信任锚或全部镜像失败）
  */
 export async function downloadYtDlp(config, { fetchImpl = fetch, onProgress, signal } = {}) {
   // 空 cacheDir 会在这里响亮失败（BAD_CONFIG），不会把二进制散到 cwd 里去。
@@ -283,48 +312,45 @@ export async function downloadYtDlp(config, { fetchImpl = fetch, onProgress, sig
   const dest = join(binDir, YTDLP_EXE)
   mkdirSync(binDir, { recursive: true })
 
-  const mirrorFailures = []
-  const sumsFailures = []
-
   signal?.throwIfAborted()
 
-  // 先取校验和：取不到只记录，不中断下载。
-  let expected
-  for (const url of sumsUrls()) {
-    signal?.throwIfAborted()
-    try {
-      expected = parseSums((await fetchBytes(fetchImpl, url)).toString('utf8')).get(YTDLP_EXE)
-      if (expected) break
-      sumsFailures.push(`${url}：文件里没有 ${YTDLP_EXE} 的哈希`)
-    } catch (err) {
-      signal?.throwIfAborted()
-      sumsFailures.push(`${url}：${errorText(err)}`)
-    }
+  // 信任锚：配置优先（成对提供），否则用源码内置 pin。**永不从镜像取。**
+  const tag = config.ytDlpTag || YTDLP_TAG
+  const expected = (config.ytDlpSha256 || YTDLP_SHA256).toLowerCase()
+  if (!/^[0-9a-f]{64}$/.test(expected)) {
+    // 内置 pin 是常量、config 层已保证格式；走到这里说明调用方绕过了 resolveConfig。
+    throw new BiliDigestError(
+      'YTDLP_DOWNLOAD_FAILED',
+      '没有可用的 yt-dlp 信任锚',
+      `期望一份 64 位十六进制 SHA-256（当前：${JSON.stringify(expected)}）。` +
+        '这不是网络问题：请升级插件，或用 ytDlpTag + ytDlpSha256 成对指定，' +
+        `或手动放置 ${YTDLP_EXE} 并配置 ytDlpPath。`,
+    )
   }
 
-  const mirrors = YTDLP_MIRRORS()
+  const mirrors = YTDLP_MIRRORS(tag)
+  const mirrorFailures = []
+
   for (const url of mirrors) {
     signal?.throwIfAborted()
-    onProgress?.({ phase: 'download', url })
+    onProgress?.(compact({ phase: 'download', url }))
 
     let buf
     try {
-      buf = await fetchBytes(fetchImpl, url)
+      buf = await fetchBytes(fetchImpl, url, signal)
     } catch (err) {
       signal?.throwIfAborted()
       mirrorFailures.push(`${url}：${errorText(err)}`)
       continue
     }
 
-    if (expected) {
-      const got = sha256(buf)
-      if (got !== expected) {
-        mirrorFailures.push(`${url}：SHA-256 不符（期望 ${shortHash(expected)}，实得 ${shortHash(got)}）`)
-        continue
-      }
+    const got = sha256(buf)
+    if (got !== expected) {
+      mirrorFailures.push(`${url}：SHA-256 与信任锚不符（期望 ${shortHash(expected)}，实得 ${shortHash(got)}）`)
+      continue
     }
 
-    // 到这里内容已通过校验（或确实没有校验源）。临时文件 + rename 就位。
+    // 内容已通过比对。临时文件 + rename 就位。
     const tmp = `${dest}.tmp-${process.pid}-${Date.now()}`
     try {
       await writeFile(tmp, buf)
@@ -335,20 +361,20 @@ export async function downloadYtDlp(config, { fetchImpl = fetch, onProgress, sig
       continue
     }
 
-    const done = { phase: 'download', url, done: true, bytes: buf.length, verified: Boolean(expected) }
-    if (!expected) done.note = `未取得 ${YTDLP_SUMS}，本次下载未经校验`
-    onProgress?.(done)
+    onProgress?.(compact({ phase: 'download', url, done: true, bytes: buf.length, verified: true }))
     return dest
   }
 
+  // 全部镜像失败。到这一步才去取 SUMS：只为诊断，不改变任何判定。
+  const { note, failures: sumsFailures } = await diagnoseSums(fetchImpl, tag, expected, signal)
+
+  const source = config.ytDlpSha256 ? 'config.ytDlpSha256' : '插件内置 YTDLP_SHA256'
   const hint = [`已尝试 ${mirrors.length} 个镜像，全部失败：`, ...mirrorFailures.map((f) => `  · ${f}`)]
+  if (note) hint.push(note)
   if (sumsFailures.length > 0) {
-    hint.push(`${YTDLP_SUMS} 也没取到（因而本次无法校验任何镜像）：`, ...sumsFailures.map((f) => `  · ${f}`))
+    hint.push(`${YTDLP_SUMS} 只用于诊断、不参与判定，但这次也没取到：`, ...sumsFailures.map((f) => `  · ${f}`))
   }
-  hint.push(`可手动下载 ${YTDLP_EXE} 放到 ${dest}`)
-  throw new BiliDigestError(
-    'YTDLP_DOWNLOAD_FAILED',
-    'yt-dlp 下载失败',
-    hint.join('\n'),
-  )
+  hint.push(`信任锚（${source}，tag ${tag}）：${YTDLP_EXE} SHA-256 = ${expected}`)
+  hint.push(`可手动下载 ${YTDLP_EXE} 放到 ${dest}，或配置 ytDlpPath 指向已有文件`)
+  throw new BiliDigestError('YTDLP_DOWNLOAD_FAILED', 'yt-dlp 下载失败', hint.join('\n'))
 }

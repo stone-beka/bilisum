@@ -49,3 +49,19 @@ test('原型链上的键名不被当作已知配置项', () => {
   // `key in DEFAULTS` 会走原型链，toString 之类会绕过未知键检查
   assert.throws(() => resolveConfig({ toString: 1 }), (e) => e.code === 'BAD_CONFIG')
 })
+
+test('ytDlpTag / ytDlpSha256 必须成对提供（只给 tag 等于关掉校验）', () => {
+  assert.equal(resolveConfig({}).ytDlpTag, '')
+  assert.equal(resolveConfig({}).ytDlpSha256, '')
+  assert.equal(resolveConfig({ ytDlpTag: '2026.08.19', ytDlpSha256: 'a'.repeat(64) }).ytDlpTag, '2026.08.19')
+  assert.throws(() => resolveConfig({ ytDlpTag: '2026.08.19' }), (e) => e.code === 'BAD_CONFIG')
+  assert.throws(() => resolveConfig({ ytDlpSha256: 'a'.repeat(64) }), (e) => e.code === 'BAD_CONFIG')
+})
+
+test('ytDlpSha256 只接受 64 位十六进制（留空合法）', () => {
+  assert.equal(resolveConfig({ ytDlpSha256: '' }).ytDlpSha256, '')
+  assert.equal(resolveConfig({ ytDlpTag: 't', ytDlpSha256: 'A'.repeat(64) }).ytDlpSha256, 'A'.repeat(64))
+  assert.throws(() => resolveConfig({ ytDlpTag: 't', ytDlpSha256: 'abc' }), (e) => e.code === 'BAD_CONFIG')
+  assert.throws(() => resolveConfig({ ytDlpTag: 't', ytDlpSha256: 'z'.repeat(64) }), (e) => e.code === 'BAD_CONFIG')
+  assert.throws(() => resolveConfig({ ytDlpTag: 42, ytDlpSha256: 'a'.repeat(64) }), (e) => e.code === 'BAD_CONFIG')
+})

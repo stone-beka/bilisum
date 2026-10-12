@@ -22,6 +22,11 @@ const VALIDATORS = {
   proxy: (v) => (typeof v === 'string' ? null : '必须是字符串：空串=直连，system=跟随系统，其它=代理 URL'),
   toolDownloadProxy: (v) => (typeof v === 'string' ? null : '必须是字符串'),
   ytDlpPath: (v) => (typeof v === 'string' ? null : '必须是字符串'),
+  ytDlpTag: (v) => (typeof v === 'string' ? null : '必须是字符串'),
+  ytDlpSha256: (v) =>
+    typeof v === 'string' && (v === '' || /^[0-9a-f]{64}$/i.test(v))
+      ? null
+      : '必须是 64 位十六进制 SHA-256，或留空表示沿用插件内置版本',
   ffmpegPath: (v) => (typeof v === 'string' ? null : '必须是字符串'),
   sttProvider: (v) => (typeof v === 'string' ? null : '必须是字符串'),
   summaryModel: (v) =>
@@ -47,6 +52,8 @@ const DEFAULTS = {
   proxy: '',
   toolDownloadProxy: 'system',
   ytDlpPath: '',
+  ytDlpTag: '',
+  ytDlpSha256: '',
   ffmpegPath: '',
   sttProvider: '',
   summaryModel: { provider: '', model: '' },
@@ -79,6 +86,15 @@ export function resolveConfig(raw = {}) {
     }
     // summaryModel 复制一份，避免调用方后续改动影响已解析配置
     out[key] = key === 'summaryModel' ? { provider: value.provider, model: value.model } : value
+  }
+  // 只给 tag 不给哈希 = 悄悄关掉校验（镜像上的 SUMS 重新变成「事实上的信任源」），
+  // 这是安全事故而不是配置便利，所以成对性由配置层把关。
+  if (Boolean(out.ytDlpTag) !== Boolean(out.ytDlpSha256)) {
+    throw new BiliDigestError(
+      'BAD_CONFIG',
+      'ytDlpTag 与 ytDlpSha256 必须成对提供：只给 tag 等于关掉校验',
+      '要么两个都给（锁定到指定版本），要么两个都留空（沿用插件内置版本 + 内置信任锚）',
+    )
   }
   return out
 }
