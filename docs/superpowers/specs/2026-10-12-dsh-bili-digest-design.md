@@ -24,8 +24,23 @@
 2. 得到**带时间戳的完整文本**
    - 优先：B 站已有字幕（CC / AI 字幕），时间戳精确到句
    - 兜底：音频 → 16kHz PCM → 静音点对齐切窗 → 本地 SenseVoice 逐窗识别，时间戳为窗口级
-3. 把带时间戳的文本（若存在 UGC 章节则一并作为骨架先验）喂给 LLM，产出**重点总结 + 章节时间段划分**
+3. 把收集到的**证据**组装成一个证据包，喂给 LLM，产出**重点总结 + 章节时间段划分**
 4. 渲染 Markdown 落盘到工作区，命令回执返回聊天
+
+**关键抽象：证据包，而不是"一段文本"。**
+
+我们做的不是"提取字幕然后总结"，而是**收集关于这个视频的证据，再让 AI 基于证据回答"这视频讲了什么"**。转写只是**一种证据源**，而且它只覆盖"有口播"的视频。把输入定义成证据包，是为了让「画面」这类证据源可以后加而不动主流程：
+
+```js
+{
+  meta:       { title, duration, uploader, description, tags, url },
+  chapters:   [ { start, end, title } ],   // L0：UP 主章节，作为划分骨架
+  transcript: { source, precision, segments },  // L1：字幕或本地 ASR
+  frames:     []                            // L2：关键帧，本轮恒为空
+}
+```
+
+本轮只填 L0 + L1；`frames` 保持空数组。将来接 `videoshot`（实测一次 HTTP 换 32 帧 + 时间戳，见 §17.1）或抽帧 OCR 时，**只是多一个证据源，`digest` 之后的所有环节一行不改**。
 
 ### 1.2 非目标
 
@@ -96,6 +111,7 @@
 | 字幕凭据 | `SESSDATA` 存 `ctx.credentials`（ref `BILI_SESSDATA`），运行时写成临时 Netscape cookie 文件给 yt-dlp，用后即删 | 账号凭据，不落明文、不常驻磁盘 |
 | 缓存目录 | `dshCachePath('bili-digest')` = `$DSH_HOME/cache/bili-digest` | F15 |
 | 长文本策略 | 单次 LLM 调用（1M 上下文足够）；超限报明确错误，map-reduce 留 P2 | YAGNI；1 小时视频约 6k token |
+| **digest 的输入形态** | **证据包**（`{ meta, chapters, transcript, frames }`），而非一段文本 | 用户确认。让"画面"等证据源可后加而不动主流程；本轮 `frames` 恒为空 |
 
 ---
 
@@ -143,9 +159,11 @@
 [7] asr        ctx.speechToText 逐片 transcribe → segments  source='local'
        │
        ▼
-[8] digest     ctx.llm.stream → 严格 JSON（摘要 + 章节 + 金句）
-[9] validate   连续性/覆盖/时长/边界吸附 + UGC 章节对齐
-[10] render    Markdown + 落盘 + 命令回执
+[8] evidence   组装证据包 { meta, chapters, transcript, frames:[] }
+       ▼
+[9] digest     ctx.llm.stream → 严格 JSON（摘要 + 章节 + 金句）
+[10] validate  连续性/覆盖/时长/边界吸附 + UGC 章节对齐
+[11] render    Markdown + 落盘 + 命令回执
 ```
 
 阶段产物全部落盘，任一步失败后重跑可复用已完成的前序阶段。
@@ -164,6 +182,7 @@ dsh-bili-digest/
 │   ├── errors.js            # 错误分类
 │   ├── json.js              # compact() / 无损 JSON 出口
 │   ├── jobs.js              # 作业注册表（落盘、串行、可查）
+│   ├── evidence.js          # 证据包组装（唯一的证据聚合点）
 │   ├── pipeline.js          # 阶段编排
 │   ├── cache.js             # 缓存布局与读写
 │   ├── media/
@@ -462,23 +481,9 @@ export async function transcribeAll(input, deps, onProgress, signal)
 
 ### 5.11 `src/digest/prompt.js`
 
-**职责**：提示词与输出契约。纯字符串构造。
+**职责**：系统提示词与输出契约。纯字符串构造。
 
-喂给模型：
-
-```
-视频标题：<title>
-视频时长：<duration 秒>
-转写来源：B站字幕 | 本地识别（窗口 30s）
-转写精度：句级 | 窗口级
-UP主章节：        ← 仅当 probe.chapters 非空
-  [00:00-03:12] 章节标题A
-  [03:12-07:45] 章节标题B
-
-带时间戳的转写：
-[00:00-00:29] 第一段文字……
-[00:30-00:59] 第二段文字……
-```
+正文证据块由 `evidence.toPromptBlock()` 产出（格式见 §5.17），本模块只负责系统提示词与 JSON 契约，**不直接读 probe / transcript**——这样新增证据源时这里无需改动。
 
 系统提示词要求：
 
@@ -506,7 +511,8 @@ UP主章节：        ← 仅当 probe.chapters 非空
 **职责**：调用 `ctx.llm` 并拿到 JSON。
 
 ```js
-export async function summarize(ctx, { transcriptBlock, duration, upChapters, override }, signal): Promise<DigestJson>
+/** @param evidence 证据包（§5.17）；本模块不关心其中各证据源怎么来的 */
+export async function summarize(ctx, evidence, { override }, signal): Promise<DigestJson>
 ```
 
 - 模型解析：`override`（`--model`）→ `config.summaryModel` → `ctx.get('agentDefaultModel').currentSelection()`
@@ -577,7 +583,87 @@ export function renderMarkdown({ meta, transcriptMeta, digest, sourceUrl, upChap
 
 `BiliDigestError extends Error`，字段 `{ code, hint, cause }`；`hint` 是给用户看的中文补救建议。
 
-### 5.17 `index.js`
+### 5.17 `src/evidence.js` 与 `src/pipeline.js`
+
+#### `src/evidence.js` —— 证据包组装（唯一的证据聚合点）
+
+```js
+/**
+ * 把各来源的观察结果组装成一个证据包。纯函数，零 I/O。
+ * @returns Evidence
+ */
+export function assemble({ probe, transcript }): Evidence
+
+/** 证据包 → 喂给 LLM 的文本块。纯函数。 */
+export function toPromptBlock(evidence, { maxKeyPoints }): string
+```
+
+```js
+/** @typedef {object} Evidence
+ *  @property {object}   meta        // title, duration, uploader, description, tags, url
+ *  @property {Chapter[]} chapters   // L0：UP 主章节，可为空数组
+ *  @property {object}   transcript  // { source, precision, language, segments }
+ *  @property {Frame[]}  frames      // L2：本轮恒为空数组
+ */
+```
+
+**证据源清单**（本轮只实现前两项；其余列在册是为了让"加一个证据源"始终是同一个动作）：
+
+| 层 | 证据源 | 本轮 | 成本 |
+|---|---|---|---|
+| L0 | 元信息（title/duration/uploader/description/tags） | ✅ `probe` 已含 | 0 额外请求 |
+| L0 | UP 主章节 `chapters` | ✅ `probe` 已含 | 0 额外请求 |
+| L1 | 转写（字幕或本地 ASR） | ✅ | 见 §5.9/§5.10 |
+| L2 | 关键帧（`videoshot` 雪碧图 + 时间戳） | ❌ 空数组 | 1 次 HTTP |
+| L2 | B 站自带 AI 总结（`conclusion`） | ❌ | 1 次 HTTP |
+| L2 | 弹幕密度 / 热门评论 | ❌ | 1–2 次 HTTP |
+
+`toPromptBlock` 产出的文本形如：
+
+```
+视频标题：<title>
+视频时长：<duration 秒>
+UP 主：<uploader>
+转写来源：B站字幕 | 本地识别（窗口 30s）
+转写精度：句级 | 窗口级
+UP主章节：
+  [00:00-03:12] 章节标题A
+  [03:12-07:45] 章节标题B
+
+带时间戳的转写：
+[00:00-00:29] 第一段文字……
+[00:30-00:59] 第二段文字……
+```
+
+`frames` 非空时，在其后追加 `关键帧：` 段落（本轮不会出现）。
+
+#### `src/pipeline.js` —— 阶段编排
+
+```js
+/**
+ * 跑完一次作业的所有阶段，逐阶段写缓存与进度。
+ * @param onPhase (phase, detail) => void  写 run.log 与 job.phase
+ */
+export async function run(ctx, cfg, job, deps, signal): Promise<RunResult>
+```
+
+阶段与产物：
+
+| phase | 产物 | 可复用条件 |
+|---|---|---|
+| `probe` | `probe.json` | 存在且未过期（TTL 10 min） |
+| `subtitle` | `segments.json` | 存在 |
+| `audio` | `audio.m4s` | 存在且非空 |
+| `decode` | `audio.wav` | 存在且非空 |
+| `window` | 片段计划（内存） | — |
+| `transcribe` | `segments.json` | 存在 |
+| `evidence` | （内存） | — |
+| `digest` | `digest.json` | 存在 |
+| `render` | `<bvid>-<slug>.md` | 总是重写 |
+
+**编排规则**：`--refresh` 忽略所有可复用条件；`/bilisub` 只跑到 `transcribe` 就返回（落盘 `segments.json`）；任一步抛 `BiliDigestError` 即终止，已完成的阶段产物保留供重跑复用。`signal` abort 时在阶段边界退出，并把 `job.status` 置为 `cancelled`。
+
+### 5.18 `index.js`
 
 ```js
 export const name = 'bili-digest'
@@ -843,6 +929,7 @@ ctx.commands.register({
 | `validate.test.mjs` | 10 条规则的通过与拒绝；边界吸附；章节合并；UP 主章节对照告警 |
 | `render.test.mjs` | Markdown 渲染；时间戳链接；notes 呈现 |
 | `json.test.mjs` | `compact()` 递归剥离；**对真实磁盘作业记录的无损 JSON 断言**（F21 的守门用例） |
+| `evidence.test.mjs` | 证据包组装：probe/transcript 缺项时的降级；`chapters` 为空与非空两条分支；`toPromptBlock` 文本块格式；`frames` 为空时不产生"关键帧"段落 |
 | `config.test.mjs` | 默认值、越界拒绝 |
 | `errors.test.mjs` | 分类映射与 hint 文案 |
 
@@ -934,19 +1021,20 @@ fixture 落库前**必须脱敏**：剥掉所有 URL 查询参数、`Cookie`/`Se
 6. `media/ffmpeg.js` + `audio/window.js`（规范 WAV + `planSegments`）+ 测试
 7. `media/ytdlp.js` audio 下载
 8. `asr/sensevoice.js` + `asr/index.js`
-9. `digest/prompt.js` + `digest/llm.js` + `digest/validate.js` + 测试
-10. `render/markdown.js` + 测试
-11. `pipeline.js` + 命令注册
-12. 安装到 profile（`package.json` 加 `link:` 依赖 + `dsh.profile.bundles`）→ **重启桌面版**（F23）
-13. E2E-1 / E2E-3 / E2E-5 验收
+9. `evidence.js` + 测试
+10. `digest/prompt.js` + `digest/llm.js` + `digest/validate.js` + 测试
+11. `render/markdown.js` + 测试
+12. `pipeline.js` + 命令注册
+13. 安装到 profile（`package.json` 加 `link:` 依赖 + `dsh.profile.bundles`）→ **重启桌面版**（F23）
+14. E2E-1 / E2E-3 / E2E-5 验收
 
 ### P1 — 字幕优先通路 + UP 主章节
 
-14. `media/ytdlp.js` subtitle + `media/subtitle.js` + fixture 测试
-15. `asr/index.js` 接入字幕后端与显式回退
-16. 凭据接入（`ctx.get('credentials')`，临时 cookie 文件）
-17. `probe.chapters` 接入提示词与 `validate` 对照
-18. E2E-2 / E2E-4 验收
+15. `media/ytdlp.js` subtitle + `media/subtitle.js` + fixture 测试
+16. `asr/index.js` 接入字幕后端与显式回退
+17. 凭据接入（`ctx.get('credentials')`，临时 cookie 文件）
+18. `probe.chapters` 经 `evidence.js` 接入提示词与 `validate` 对照
+19. E2E-2 / E2E-4 验收
 
 ---
 
@@ -966,6 +1054,8 @@ fixture 落库前**必须脱敏**：剥掉所有 URL 查询参数、`Cookie`/`Se
 | 代理 | 访问 B 站：**强制直连**（`proxy: ''`）；下载 yt-dlp：**跟随系统代理**（`toolDownloadProxy: 'system'`）。分目标，因为本机两者要求相反（F25） |
 | 子进程临时目录 | 一律由 `childEnv()` 设为 `<cacheDir>/tmp`（F26） |
 | 音轨选择 | 显式 format_id：`balanced`→30232 / `smallest`→30216 / `best`→30280（F29） |
+| 证据包 `frames` | 本轮恒为 `[]`；L2 证据源（关键帧 / B站AI总结 / 弹幕热区）只登记在册，不实现 |
+| 视觉模型 | 本轮不涉及。`ctx.llm` 的模型若为纯文本（如 `deepseek-v4.1-flash`），`frames` 非空时需显式配置带 image 输入的模型 |
 | 缓存淘汰 | v1 不自动淘汰；LRU 留 P2 |
 | 非 B 站站点 | v1 拒绝。yt-dlp 使其几乎免费，但留 P2 并需单独验收 |
 
@@ -1031,6 +1121,7 @@ Spike 目的：验证路线 A（yt-dlp 取数）在本机是否真的可行。�
 | 音频下载 | `-f 30232` 得 2.61 MB / 约 2 s |
 | 音频容器 | 文件头 `ftyp iso5 … avc1 iso5 dsms msix dash` → **fMP4 + AAC**，ffmpeg 的合法输入 |
 | 匿名字幕 | `subtitles=[]`、`automatic_captions=[]` —— 与 F2 一致 |
+| **`videoshot` 接口（L2 证据源的可行性）** | 匿名可访问，`code=0`：一次 HTTP 返回 `img_x_len=10 / img_y_len=10 / img_x_size=160 / img_y_size=90`、雪碧图 URL，以及 `index=[0,0,5,11,…]` 共 32 个**秒级时间戳**。→ 「不用下载视频就能拿到全片关键帧」成立，故 L2 关键帧证据源成本极低 |
 
 ### 17.2 两个环境陷阱（都已实测复现 + 找到修复）
 
