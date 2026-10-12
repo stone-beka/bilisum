@@ -1,0 +1,7 @@
+# dsh-bili-digest 的 bundle patch：插入唯一一行 Host 插件。
+# profile 侧可按需覆盖 config。
+- insert:
+    - id: bili-digest
+      name: 'dsh-bili-digest'
+      config:
+        cacheDir: !!js dshCachePath('bili-digest')
