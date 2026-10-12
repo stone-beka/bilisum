@@ -286,10 +286,11 @@ export function reduceProbe(raw) {
  * 顺序是可观测的契约：**先判可执行文件**（exe 缺失时直接 `YTDLP_MISSING`，否则这个码
  * 会被迟到的检查掩盖、永远发不出来），再构造 env（cacheDir 空则 `BAD_CONFIG`），最后起进程。
  *
- * 412 有两个来源，都在进 JSON.parse 之前判掉：① 非零退出的 stderr / stdout
- * （`runYtDlp` 的 `classifyYtDlpFailure`）；② stdout 本身带 412 指纹。②**与响应体
- * 是不是 HTML 形状无关**——风控页可能以注释、`<script>`、BOM 残留起头，只按 `HTML_RE`
- * 分流会把风控误报成 "不是合法 JSON"。这样用户拿到的始终是「风控」。
+ * 412 有两个来源：① 非零退出的 stderr / stdout（`runYtDlp` 的 `classifyYtDlpFailure`）；
+ * ② stdout 本身不是 JSON、且带 412 指纹。②**与响应体是不是 HTML 形状无关**——风控页可能
+ * 以注释、`<script>`、BOM 残留起头，只按 `HTML_RE` 分流会把风控误报成 "不是合法 JSON"。
+ * 但②**只在 `JSON.parse` 失败之后**才跑：解析成功说明这就是 info dict，正文里的
+ * "Precondition Failed" 字样（教程类视频的标题/简介）不得被当成风控指纹。
  *
  * @param config 已解析配置
  * @param url 已归一化的视频地址
@@ -314,19 +315,21 @@ export async function probe(config, url, { cookieFile, signal, onProgress, spawn
   })
 
   const body = stdout.trim()
-  if (HTTP_412_RE.test(body)) throw blockedError()
-  if (HTML_RE.test(body)) {
-    throw new BiliDigestError(
-      'YTDLP_FAILED',
-      'yt-dlp 返回的是 HTML 页面而不是 JSON',
-      'B 站对匿名/异常请求会回 HTML 拦截页。先确认 proxy 为空串（直连），再配置 BILI_SESSDATA 后重试。',
-    )
-  }
-
   let raw
   try {
     raw = JSON.parse(body)
   } catch (err) {
+    // 只有在"根本不是 JSON"的时候才去辨认风控/网关错误页。
+    // 反过来做会让**成功的** JSON 正文里恰好出现的 "Precondition Failed"
+    // 之类字样把一次正常的 probe 误判成风控拦截。
+    if (HTTP_412_RE.test(body)) throw blockedError()
+    if (HTML_RE.test(body)) {
+      throw new BiliDigestError(
+        'YTDLP_FAILED',
+        'yt-dlp 返回的是 HTML 页面而不是 JSON',
+        'B 站对匿名/异常请求会回 HTML 拦截页。先确认 proxy 为空串（直连），再配置 BILI_SESSDATA 后重试。',
+      )
+    }
     throw new BiliDigestError(
       'YTDLP_FAILED',
       'yt-dlp 返回的不是合法 JSON',

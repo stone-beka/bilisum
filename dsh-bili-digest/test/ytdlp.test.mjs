@@ -526,6 +526,25 @@ test('probe 在 stdout 带 412 但不是 HTML 形状时也给风控（412 判定
   assert.doesNotMatch(err.message, /JSON/)
 })
 
+test('成功的 JSON 正文里出现 "Precondition Failed" 字样不得被误判为风控拦截', async (t) => {
+  const { dir, cfg } = await fixtureConfig()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  // 这条用例锁住的是"先 parse、后嗅探"的顺序：反过来做，
+  // 一个讲 HTTP 状态码的视频会因为简介里写了这几个词而 probe 失败。
+  const info = {
+    id: 'BV1xx411c7mD',
+    title: 'HTTP 状态码科普：Precondition Failed 是什么意思',
+    description: '本视频讲解 412 Precondition Failed 的语义',
+    tags: ['Precondition Failed', 'HTTP'],
+  }
+  const { spawnImpl } = fakeSpawn({ stdout: JSON.stringify(info), code: 0 })
+
+  const result = await probe(cfg, 'https://www.bilibili.com/video/BV1xx411c7mD', { spawnImpl })
+
+  assert.equal(result.id, 'BV1xx411c7mD')
+  assert.match(result.title, /Precondition Failed/)
+})
+
 test('probe 在找不到 yt-dlp.exe 时抛 YTDLP_MISSING，且不启动进程', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'ytdlp-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
