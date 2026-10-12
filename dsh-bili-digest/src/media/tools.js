@@ -161,3 +161,20 @@ export function spawnEnv(env) {
   const { __proxy, ...rest } = env
   return compact(rest)
 }
+
+/**
+ * 把代理策略翻译成 yt-dlp 的 `--proxy` 参数。
+ *
+ * 策略值不是 URL：`''`/`'direct'`=强制直连，`'system'`=跟随系统。
+ * 直接拼进 `--proxy=` 会产生非法的 `--proxy=system`。
+ *
+ * @returns 要展开进参数数组的片段：
+ *   直连 → `['--proxy=']`（空值即让 yt-dlp 不走代理）
+ *   跟随系统 → `[]`（**不传这个参数**，yt-dlp 才会去读系统代理）
+ *   显式代理 → `['--proxy=<url>']`
+ */
+export function proxyArg(policy) {
+  if (policy === undefined || policy === null || policy === '' || policy === 'direct') return ['--proxy=']
+  if (policy === 'system') return []
+  return [`--proxy=${policy}`]
+}

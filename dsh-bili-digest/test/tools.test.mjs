@@ -4,7 +4,15 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
-import { resolveYtDlp, resolveFfmpeg, checkTools, childEnv, ensureTmpDir, spawnEnv } from '../src/media/tools.js'
+import {
+  resolveYtDlp,
+  resolveFfmpeg,
+  checkTools,
+  childEnv,
+  ensureTmpDir,
+  spawnEnv,
+  proxyArg,
+} from '../src/media/tools.js'
 import { resolveConfig } from '../src/config.js'
 import { BiliDigestError } from '../src/errors.js'
 
@@ -273,6 +281,33 @@ test('spawnEnv 剥掉 __proxy 载具且不动其它键', async () => {
     const { __proxy, ...expected } = env
     assert.equal(__proxy, 'http://127.0.0.1:1080')
     assert.deepEqual(ready, expected)
+  })
+})
+
+// ---------- 代理策略 → yt-dlp --proxy 参数 ----------
+
+test('proxyArg 把直连策略翻译成空的 --proxy=', () => {
+  assert.deepEqual(proxyArg(''), ['--proxy='])
+  assert.deepEqual(proxyArg('direct'), ['--proxy='])
+  assert.deepEqual(proxyArg(undefined), ['--proxy='])
+})
+
+test('proxyArg 对 system 策略返回空数组（必须靠不传参数生效）', () => {
+  assert.deepEqual(proxyArg('system'), [], '传 --proxy=system 是非法参数，传 --proxy= 又会禁掉系统代理')
+})
+
+test('proxyArg 对显式 URL 返回 --proxy=<url>', () => {
+  assert.deepEqual(proxyArg('http://127.0.0.1:1080'), ['--proxy=http://127.0.0.1:1080'])
+})
+
+test('proxyArg 与 childEnv 的策略值配套使用', async () => {
+  await withDir(async (dir) => {
+    // 这是本模块存在的理由：策略值不能直接拼进 --proxy=
+    const direct = childEnv(resolveConfig({ cacheDir: dir }), 'bilibili')
+    const follow = childEnv(resolveConfig({ cacheDir: dir, toolDownloadProxy: 'system' }), 'tool-download')
+    assert.deepEqual(proxyArg(direct.__proxy), ['--proxy='])
+    assert.deepEqual(proxyArg(follow.__proxy), [])
+    assert.ok(!proxyArg(follow.__proxy).some((a) => a.includes('system')))
   })
 })
 
