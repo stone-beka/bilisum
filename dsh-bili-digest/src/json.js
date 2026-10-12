@@ -16,6 +16,10 @@
  */
 export function compact(value) {
   if (Array.isArray(value)) return value.map((item) => compact(item))
+  // Buffer / TypedArray / ArrayBuffer 是二进制，不是可递归的普通对象：
+  // `Object.entries(Buffer)` 给出 {'0':..,'1':..}，会把 PCM 摊成字节下标对象
+  // （既毁掉音频，也会把几百 MB 的缓冲撑成几千万个键）。原样返回。
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return value
   if (value !== null && typeof value === 'object') {
     const out = {}
     for (const [key, item] of Object.entries(value)) {

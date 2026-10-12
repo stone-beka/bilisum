@@ -16,5 +16,8 @@
   },
   "engines": { "node": ">=20" },
   "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "cordis", "bilibili", "transcribe"],
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "dependencies": {
+    "@ffmpeg-installer/win32-x64": "^4.1.0"
+  }
 }

@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync } from 'node:fs'
 import { rename, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { createRequire } from 'node:module'
+import { dirname, join } from 'node:path'
 import { cachePaths } from '../cache.js'
 import { BiliDigestError } from '../errors.js'
 import { compact } from '../json.js'
@@ -48,6 +49,30 @@ export function resolveYtDlp(config) {
 /** 找出 ffmpeg.exe 的绝对路径。顺序：显式配置 → `<cacheDir>/bin/ffmpeg.exe` → undefined。 */
 export function resolveFfmpeg(config) {
   return resolveExe(config, config.ffmpegPath, FFMPEG_EXE)
+}
+
+const require = createRequire(import.meta.url)
+
+/**
+ * 插件依赖 `@ffmpeg-installer/win32-x64` 里那份 ffmpeg.exe 的绝对路径；依赖缺失时 undefined。
+ *
+ * 本机**没有任何 ffmpeg 二进制**（`E:\dsh\ffmpeg.dll` 是 Chromium 的，不是 CLI），所以这份
+ * 随 npm tarball 分发、无 postinstall 下载的副本是「装完依赖即可用」的唯一保证。
+ *
+ * 它**刻意不参与 `resolveFfmpeg` 的两段查找**：那条链描述的是「用户可见的工具位置」
+ * （`ffmpegPath` / `<cacheDir>/bin`），`checkTools` 按它报「工具未就位」；而这份副本会随
+ * `node_modules` 重装消失，不能算「已就位」。它的用途只有一个：解码时在用户没指定
+ * 工具位置的情况下兜底（见 `ffmpeg.js` 的 `resolveDecoderExe`）。
+ */
+export function resolveBundledFfmpeg() {
+  try {
+    // 该包没有 main 入口，只能靠 package.json 定位目录
+    const pkg = require.resolve('@ffmpeg-installer/win32-x64/package.json')
+    const exe = join(dirname(pkg), FFMPEG_EXE)
+    return existsSync(exe) ? exe : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**
