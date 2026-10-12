@@ -18,7 +18,7 @@
 - **所有子进程的 env 一律由 `childEnv()` 构造**，绝不直接继承 `process.env`。规格 F25/F26。
 - **所有对外返回值过 `compact()`**，剥离 `undefined`。规格 F21。
 - **命令 handler 绝不抛异常**，一律转成 `{ kind:'error', text }`。
-- 包为 ESM（`"type": "module"`），只 import `node:` 内置模块。
+- 包为 ESM（`"type": "module"`）。可以 import `node:` 内置模块与第三方 npm 依赖；**绝不 import `@deepseek-ai/*`**（规格 F11，第三方插件解析不到该包）。
 - 时间单位统一用**秒**（浮点）；只有配置文件里写成 `windowSeconds` 这类带单位后缀的名字。
 - Segment 形状固定为 `{ start: number, end: number, text: string }`（秒）。
 - 所有文件写入走「临时文件 + rename」。
@@ -120,6 +120,8 @@ dsh-bili-digest/
       config:
         cacheDir: !!js dshCachePath('bili-digest')
 ```
+
+> `package.json` 里 `main` / `files` 指向的 `index.js` 要到 Task 20 才创建。这是刻意的：Task 1 的交付物是可独立测试的 `json.js` 与包元数据，命令注册属于最后一个任务。在此之前不要重启 DSH。
 
 `.gitignore`：
 
@@ -1832,9 +1834,14 @@ git commit -m "feat(bili-digest): yt-dlp 封装（probe/version + 失败分类�
 
 - [ ] **Step 1: 装依赖并写失败测试**
 
+**在插件目录里**（`<repo>/dsh-bili-digest/`）安装，不是在 profile 目录：
+
 ```bash
+cd dsh-bili-digest
 pnpm add @ffmpeg-installer/win32-x64
 ```
+
+为什么必须在插件目录：profile 用的是 `link:` 依赖，它**不会**把插件自己的依赖装进 profile 的 `node_modules`；而 `installFfmpeg()` 用 `createRequire(import.meta.url)` 解析，解析起点是插件的真实路径。装在别处就会 `MODULE_NOT_FOUND`。
 
 `test/ffmpeg.test.mjs`：
 
@@ -3000,7 +3007,8 @@ git commit -m "feat(bili-digest): 转写后端选择与显式回退"
 - Consumes: 无（纯函数）
 - Produces:
   - `assemble({ probe, transcript }): Evidence`，`Evidence = { meta, chapters, transcript, frames }`
-  - `toPromptBlock(evidence, { maxKeyPoints }): string`
+  - `toPromptBlock(evidence): string`
+  - `formatTime(seconds): string`、`sourceLabel(transcript): string`（**来源文案的唯一实现**，Task 18 与 Task 20 都 import 它）
   - `transcriptChars(evidence): number`
 
 - [ ] **Step 1: 写失败测试**
@@ -3010,7 +3018,7 @@ git commit -m "feat(bili-digest): 转写后端选择与显式回退"
 ```js
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { assemble, toPromptBlock, transcriptChars } from '../src/evidence.js'
+import { assemble, toPromptBlock, transcriptChars, sourceLabel } from '../src/evidence.js'
 
 const probe = {
   id: 'BV1GJ411x7h7',
@@ -3096,6 +3104,14 @@ test('字幕来源的精度标注为句级', () => {
   assert.match(block, /转写来源：B站字幕（句级）/)
   assert.match(block, /转写精度：句级/)
 })
+
+test('sourceLabel 是唯一的来源文案实现，三种来源都覆盖', () => {
+  assert.equal(sourceLabel({ source: 'subtitle' }), 'B站字幕（句级）')
+  assert.equal(sourceLabel({ source: 'local', windowSeconds: 45 }), '本地识别（窗口 45s，静音点对齐）')
+  // 缺 windowSeconds 时回落 30，而不是算出 undefined 或 NaN
+  assert.equal(sourceLabel({ source: 'local' }), '本地识别（窗口 30s，静音点对齐）')
+  assert.equal(sourceLabel(undefined), '本地识别（窗口 30s，静音点对齐）')
+})
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -3159,6 +3175,20 @@ export function transcriptChars(evidence) {
 }
 
 /**
+ * 转写来源的展示文案。**这是唯一的来源标注实现。**
+ *
+ * `render/markdown.js` 的头部与 `command.js` 的回执都 import 这一个函数——
+ * 三处各写一份同样的字符串拼接是典型的 DRY 破坏，改一处漏两处。
+ *
+ * 窗口长度来自 transcript.windowSeconds，**不能**用 duration/片段数反推：
+ * 片段数受静音吸附影响，反推出来是错的。
+ */
+export function sourceLabel(transcript) {
+  if ((transcript?.source ?? 'local') === 'subtitle') return 'B站字幕（句级）'
+  return `本地识别（窗口 ${Math.max(1, Math.round(transcript?.windowSeconds || 30))}s，静音点对齐）`
+}
+
+/**
  * 证据包 → 喂给 LLM 的文本块。纯函数。
  *
  * 注意这里**没有** maxKeyPoints 之类的指令——那些属于系统提示词（digest/prompt.js）。
@@ -3172,10 +3202,7 @@ export function toPromptBlock(evidence) {
   ]
   if (meta.uploader) lines.push(`UP 主：${meta.uploader}`)
 
-  const sourceLabel = transcript.source === 'subtitle'
-    ? 'B站字幕（句级）'
-    : `本地识别（窗口 ${Math.max(1, Math.round(transcript.windowSeconds || 30))}s，静音点对齐）`
-  lines.push(`转写来源：${sourceLabel}`)
+  lines.push(`转写来源：${sourceLabel(transcript)}`)
   lines.push(`转写精度：${transcript.precision === 'sentence' ? '句级' : '窗口级'}`)
 
   if (Array.isArray(chapters) && chapters.length > 0) {
@@ -3969,21 +3996,13 @@ Expected: FAIL —— 模块不存在
 `src/render/markdown.js`：
 
 ```js
-import { formatTime } from '../evidence.js'
+// sourceLabel 来自 evidence.js —— 来源文案只有那一份实现，这里不重复定义
+import { formatTime, sourceLabel } from '../evidence.js'
 
 /** 生成可点击的 B 站时间戳链接。 */
 export function timeLink(bvid, seconds, label) {
   const t = Math.max(0, Math.round(Number(seconds) || 0))
   return `[${label ?? formatTime(t)}](https://www.bilibili.com/video/${bvid}?t=${t})`
-}
-
-/**
- * 转写来源标注。窗口长度来自 transcript.windowSeconds，
- * **不能**用 duration/片段数反推——片段数受静音吸附影响，反推出来的值是错的。
- */
-function sourceLabel(transcript) {
-  if (transcript.source === 'subtitle') return 'B站字幕（句级）'
-  return `本地识别（窗口 ${Math.max(1, Math.round(transcript.windowSeconds || 30))}s，静音点对齐）`
 }
 
 /** 渲染最终 Markdown。纯函数。 */
@@ -4448,7 +4467,8 @@ Expected: FAIL —— 模块不存在
 
 ```js
 import { BiliDigestError } from './errors.js'
-import { formatTime } from './evidence.js'
+// sourceLabel 与 formatTime 都来自 evidence.js：来源文案只有那一份实现
+import { formatTime, sourceLabel } from './evidence.js'
 
 const FLAG_OPTIONS = {
   '--no-local': 'noLocal',
@@ -4515,18 +4535,13 @@ export function parseCommandInput(rawInput) {
   return { action, target, options }
 }
 
-const SOURCE_LABEL = {
-  local: (windowSeconds) => `本地识别（窗口 ${Math.max(1, Math.round(windowSeconds || 30))}s，静音点对齐）`,
-  subtitle: () => 'B站字幕（句级）',
-}
-
 /**
  * 成功回执。只放回执与路径，**不把全文塞进 UI**。
  * 所有插值都显式 String() 化，杜绝 undefined 字面量。
  */
 export function buildReceipt(result) {
   const duration = Number(result?.duration ?? 0)
-  const label = (SOURCE_LABEL[result?.source] ?? SOURCE_LABEL.local)(result?.windowSeconds)
+  const label = sourceLabel({ source: result?.source, windowSeconds: result?.windowSeconds })
   const lines = [
     `✅ 已完成：${String(result?.title ?? '未命名视频')}`,
     `时长 ${formatTime(duration)} ｜ 转写来源：${label}`,
@@ -4578,12 +4593,12 @@ import { downloadYtDlp } from './src/media/tools.js'
 export const name = 'bili-digest'
 export const inject = ['commands']
 
-const USAGE = [
+const USAGE = (command) => [
   '用法：',
-  '  /bilisum <BV号|链接> [选项]   跑完整流水线',
-  '  /bilisum status <jobId>       查作业状态',
-  '  /bilisum list                 列作业',
-  '  /bilisum cancel <jobId>       取消作业',
+  `  /${command} <BV号|链接> [选项]   跑完整流水线`,
+  `  /${command} status <jobId>      查作业状态`,
+  `  /${command} list                列作业`,
+  `  /${command} cancel <jobId>      取消作业`,
   '选项：--lang <code> --window <30-60> --model <provider/model> --no-local --out <dir> --refresh --update-tools',
 ].join('\n')
 
@@ -4640,7 +4655,7 @@ export function apply(ctx, config = {}) {
       }
 
       // start
-      if (parsed.target === '') return { kind: 'error', text: USAGE }
+      if (parsed.target === '') return { kind: 'error', text: USAGE(cfg.command) }
 
       if (parsed.options.updateTools) {
         await downloadYtDlp(cfg, {})
