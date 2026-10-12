@@ -1,6 +1,6 @@
-import { readdir, readFile } from 'node:fs/promises'
+import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
-import { writeJsonAtomic } from './cache.js'
+import { readJson, writeJsonAtomic } from './cache.js'
 import { compact } from './json.js'
 
 const TERMINAL = new Set(['done', 'failed', 'cancelled'])
@@ -9,7 +9,9 @@ const TERMINAL = new Set(['done', 'failed', 'cancelled'])
 function newId(now = new Date()) {
   const p = (n, w = 2) => String(n).padStart(w, '0')
   const stamp = `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`
-  return `${stamp}-${Math.random().toString(36).slice(2, 8)}`
+  // 后缀必须钉死 6 位：`Math.random().toString(36)` 可能短于 6 个字符
+  // （例如 0.5 → '0.i'），不补零就只是「大概率」符合格式。
+  return `${stamp}-${Math.random().toString(36).slice(2, 8).padEnd(6, '0')}`
 }
 
 const nowIso = () => new Date().toISOString()
@@ -32,8 +34,6 @@ export class Registry {
   #active = null
   #controller = null
   #disposed = false
-  /** 串行化所有状态变更，避免 cancel 与作业收尾交错写同一条记录。 */
-  #ops = Promise.resolve()
 
   /**
    * @param root cacheDir
@@ -56,7 +56,9 @@ export class Registry {
       return
     }
     for (const name of names) {
-      const job = await this.#readJobFile(join(this.#root, 'jobs', name, 'job.json'))
+      // 半截/损坏的记录（第二次修改前 kill 掉的进程）由 readJson 变成 null，
+      // 直接跳过，不让它毁掉整个列表。
+      const job = await readJson(join(this.#root, 'jobs', name, 'job.json'))
       if (!job || typeof job.id !== 'string' || this.#jobs.has(job.id)) continue
       // 上次进程死掉留下的 running/queued 一律视为已中断：进程没了就不可能还在跑
       if (!TERMINAL.has(job.status)) {
@@ -69,7 +71,13 @@ export class Registry {
   }
 
   list() {
-    return [...this.#jobs.values()].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+    // 同一秒内创建的作业 `createdAt` 完全相同（id 的精度也只到秒），只比时间
+    // 会依赖 Map 插入顺序，结果不稳定；再按 id 倒序做决定性 tiebreak。
+    return [...this.#jobs.values()].sort(
+      (a, b) =>
+        String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')) ||
+        String(b.id ?? '').localeCompare(String(a.id ?? '')),
+    )
   }
 
   get(id) {
@@ -101,7 +109,7 @@ export class Registry {
       this.#queue.push({ job, run })
     }
     await this.#persist(job)
-    this.#pump()
+    this.#kick()
     return job
   }
 
@@ -116,23 +124,23 @@ export class Registry {
   }
 
   /**
-   * 取消作业。在跑的走 abort（真正的中止由作业体对 signal 的响应决定），
-   * 排队的直接落到 cancelled。返回当前快照。
+   * 取消作业。**同步**返回当前快照（`Job|undefined`，冻结的跨任务契约）。
+   * 在跑的走 abort（真正的中止由作业体对 signal 的响应决定），排队的直接落到
+   * cancelled。落盘是 fire-and-forget：`#persist` 自己吞异常，且
+   * `writeJsonAtomic` 写唯一临时名再 rename，与其它落盘并发安全。
    */
   cancel(id) {
-    return this.#enqueue(async () => {
-      const job = this.#jobs.get(id)
-      if (!job || TERMINAL.has(job.status)) return job
-      job.updatedAt = nowIso()
-      if (this.#active?.job.id === id) {
-        this.#controller?.abort(new Error('已取消'))
-      } else {
-        this.#queue = this.#queue.filter((item) => item.job.id !== id)
-        job.status = 'cancelled'
-        await this.#persist(job)
-      }
-      return job
-    })
+    const job = this.#jobs.get(id)
+    if (!job || TERMINAL.has(job.status)) return job
+    job.updatedAt = nowIso()
+    if (this.#active?.job.id === id) {
+      this.#controller?.abort(new Error('已取消'))
+    } else {
+      this.#queue = this.#queue.filter((item) => item.job.id !== id)
+      job.status = 'cancelled'
+      void this.#persist(job).catch(() => {})
+    }
+    return job
   }
 
   /**
@@ -158,15 +166,27 @@ export class Registry {
    */
   async dispose() {
     this.#disposed = true
-    for (const item of this.#queue) {
+    const dropped = this.#queue
+    this.#queue = []
+    for (const item of dropped) {
       if (!TERMINAL.has(item.job.status)) {
         item.job.status = 'cancelled'
         item.job.updatedAt = nowIso()
       }
     }
-    this.#queue = []
+    // 队列里的作业也得落盘：只改内存的话，重启后 load() 会把它们读成
+    // failed/INTERRUPTED，与用户看到的「已取消」不符。
+    await Promise.all(dropped.map((item) => this.#persist(item.job)))
     this.#controller?.abort(new Error('插件已卸载'))
     while (this.#active) await delay(10)
+  }
+
+  /**
+   * fire-and-forget 地启动泵。宿主传入的 `logger.warn` 可能抛错，所以两条
+   * 调用路径都必须挂 catch——否则会漏出 unhandled rejection。
+   */
+  #kick() {
+    void this.#pump().catch((err) => this.#log(`作业泵异常: ${err?.message ?? err}`))
   }
 
   /**
@@ -207,7 +227,7 @@ export class Registry {
         this.#active = null
         this.#controller = null
       }
-      void this.#pump().catch((err) => this.#log(`作业泵异常: ${err?.message ?? err}`))
+      this.#kick()
     }
   }
 
@@ -220,27 +240,16 @@ export class Registry {
     }
   }
 
-  /** 半截/损坏的记录（第二次修改前 kill 掉的进程）直接跳过，不让它毁掉整个列表。 */
-  async #readJobFile(file) {
-    try {
-      return JSON.parse(await readFile(file, 'utf8'))
-    } catch {
-      return null
-    }
-  }
-
+  /**
+   * 宿主传入的 logger 由别人实现，`warn` 可能抛错——注册表的正确性不依赖它，
+   * 所以这里兜底吞掉，避免 logger 的异常升级成 unhandled rejection。
+   */
   #log(message) {
-    this.#logger?.warn?.(`bili-digest: ${message}`)
-  }
-
-  /** 所有异步状态变更排到同一条链上，顺序执行。 */
-  #enqueue(fn) {
-    const next = this.#ops.then(fn, fn)
-    this.#ops = next.then(
-      () => {},
-      () => {},
-    )
-    return next
+    try {
+      this.#logger?.warn?.(`bili-digest: ${message}`)
+    } catch {
+      // 有意忽略：日志是尽力而为的
+    }
   }
 }
 
