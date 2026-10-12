@@ -547,7 +547,9 @@ export function validateDigest(digest, { duration, segments, upChapters }):
 7. 章节数上限 `max(2, ceil(duration / 60))`；超限则合并最短的相邻对
 8. `title` ≤ 30 字符；`tldr` ≤ 400 字符
 9. **边界吸附**：把每个 `start`/`end` 吸附到最近的 `segments` 边界（容差 5 s）；吸附后重跑规则 3–6
-10. **与 UP 主章节对照**（仅当 `upChapters` 非空）：若某 LLM 章节跨越了 UP 主章节边界超过 60 s 且不与任何 UP 主边界对齐，记入 `notes` 告警（不判失败）
+10. **与 UP 主章节对照**（仅当 `upChapters` 非空）：若某章节**跨越**了 UP 主章节边界，且它的两端都不在该边界 **30 s** 以内，记入 `warnings`（不判失败）。这个口径正好抓「模型把本该分开的两段合成一段」，又不会对"合理合并短章节"误报
+
+返回值：`{ ok: true, value, warnings }` 或 `{ ok: false, problems }`。`warnings` 走返回值而**不塞进 `value`** —— `value` 会被落盘，混入内部字段会污染 §5.11 的输出契约。
 
 通过后返回**修正过的**值；失败返回 `problems` 供重试提示词使用。重试一次仍失败 → `DIGEST_SCHEMA_INVALID`。
 
@@ -595,14 +597,14 @@ export function renderMarkdown({ meta, transcriptMeta, digest, sourceUrl, upChap
 export function assemble({ probe, transcript }): Evidence
 
 /** 证据包 → 喂给 LLM 的文本块。纯函数。 */
-export function toPromptBlock(evidence, { maxKeyPoints }): string
+export function toPromptBlock(evidence): string
 ```
 
 ```js
 /** @typedef {object} Evidence
  *  @property {object}   meta        // title, duration, uploader, description, tags, url
  *  @property {Chapter[]} chapters   // L0：UP 主章节，可为空数组
- *  @property {object}   transcript  // { source, precision, language, segments }
+ *  @property {object}   transcript  // { source, precision, language, windowSeconds, segments }
  *  @property {Frame[]}  frames      // L2：本轮恒为空数组
  */
 ```
@@ -877,7 +879,7 @@ ctx.commands.register({
 | `STT_UNAVAILABLE` | `ctx.get('speechToText')` 为空 | 说明需启用 voice-input bundle |
 | `STT_MODEL_MISSING` | 模型未下载且下载失败 | 说明 239 MB 下载与镜像设置 |
 | `STT_FAILED` | provider 推理失败 | 附 provider 错误码 |
-| `STT_EMPTY` | 全部窗口产出为空 | 可能是纯音乐/无人声；提示不代表成功 |
+| `STT_EMPTY` | 全部窗口产出为空 | **告警而非失败**：走 `notes` 提示「可能是纯音乐或无人声视频；这不代表成功」，作业仍继续（用户至少能拿到"这段没有口播"的结论） |
 | `LLM_UNAVAILABLE` | `ctx.get('llm')` 为空 | 降级为只出文稿 |
 | `LLM_CONTEXT_EXCEEDED` | 转写超上下文 | 建议换更大上下文模型 |
 | `LLM_RATE_LIMIT` | provider 限流 | 稍后重试 |
