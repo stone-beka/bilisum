@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from 'node:fs'
+import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { writeJsonAtomic } from './cache.js'
 import { compact } from './json.js'
@@ -20,10 +20,9 @@ const nowIso = () => new Date().toISOString()
  * 串行是硬要求，不是优化：SenseVoice 推理峰值内存按 GB 计（规格 F19），
  * 并发会把机器打爆。作业制本身是为了绕开工具/命令的超时（规格 F22）。
  *
- * 会话可见性说明：`get()`/`list()` 是同步的，而 Node 没有任何办法把异步 I/O 的
- * 结果同步取出来，所以历史作业必须在构造函数返回前就进内存——磁盘扫描是
- * **同步**做的（只读 jobs 目录下一层的小 job.json，不碰日志与音频）。
- * 这样 `new Registry(dir)` 之后立刻 `get(id)` 才看得见历史记录。
+ * 会话可见性说明：`get()`/`list()` 是同步的，历史作业要先进内存才看得见。
+ * 读盘走显式的 `await load()`（只读 jobs 目录下一层的小 job.json，不碰日志
+ * 与音频），由调用方决定时机；构造函数不做任何 I/O，理由见下。
  */
 export class Registry {
   #root
@@ -36,14 +35,38 @@ export class Registry {
   /** 串行化所有状态变更，避免 cancel 与作业收尾交错写同一条记录。 */
   #ops = Promise.resolve()
 
+  /**
+   * @param root cacheDir
+   * @param logger 可为 undefined
+   *
+   * **构造函数绝不做任何 I/O。** 插件挂载跑在 DSH 的事件循环上，在这里同步扫盘
+   * 会让挂载耗时随历史作业数增长。读盘是显式的 `await load()`，由调用方决定时机。
+   */
   constructor(root, logger) {
     this.#root = root
     this.#logger = logger
-    this.#readFromDisk()
   }
 
-  /** 历史作业已在构造时读回；此方法保留给显式调用方，可安全重复调用。 */
-  async load() {}
+  /** 读回磁盘上的历史作业。幂等：重复调用不会产生重复条目。 */
+  async load() {
+    let names = []
+    try {
+      names = await readdir(join(this.#root, 'jobs'))
+    } catch {
+      return
+    }
+    for (const name of names) {
+      const job = await this.#readJobFile(join(this.#root, 'jobs', name, 'job.json'))
+      if (!job || typeof job.id !== 'string' || this.#jobs.has(job.id)) continue
+      // 上次进程死掉留下的 running/queued 一律视为已中断：进程没了就不可能还在跑
+      if (!TERMINAL.has(job.status)) {
+        job.status = 'failed'
+        job.updatedAt = nowIso()
+        job.error = { code: 'INTERRUPTED', message: '进程重启，作业已中断' }
+      }
+      this.#jobs.set(job.id, job)
+    }
+  }
 
   list() {
     return [...this.#jobs.values()].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
@@ -197,31 +220,10 @@ export class Registry {
     }
   }
 
-  /** 读回磁盘上的历史作业；目录不存在（首次运行）就当空处理。 */
-  #readFromDisk() {
-    let names = []
-    try {
-      names = readdirSync(join(this.#root, 'jobs'))
-    } catch {
-      return
-    }
-    for (const name of names) {
-      const job = this.#readJobFile(join(this.#root, 'jobs', name, 'job.json'))
-      if (!job || typeof job.id !== 'string' || this.#jobs.has(job.id)) continue
-      // 上次进程死掉留下的 running/queued 一律视为已中断：进程没了就不可能还在跑
-      if (!TERMINAL.has(job.status)) {
-        job.status = 'failed'
-        job.updatedAt = nowIso()
-        job.error = { code: 'INTERRUPTED', message: '进程重启，作业已中断' }
-      }
-      this.#jobs.set(job.id, job)
-    }
-  }
-
   /** 半截/损坏的记录（第二次修改前 kill 掉的进程）直接跳过，不让它毁掉整个列表。 */
-  #readJobFile(file) {
+  async #readJobFile(file) {
     try {
-      return JSON.parse(readFileSync(file, 'utf8'))
+      return JSON.parse(await readFile(file, 'utf8'))
     } catch {
       return null
     }

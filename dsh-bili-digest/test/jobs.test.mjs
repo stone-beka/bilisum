@@ -98,6 +98,7 @@ test('作业状态落盘，新 Registry 实例可读回', async () => {
   await reg.wait(job.id, 5)
   await reg.dispose()
   const reg2 = new Registry(dir)
+  await reg2.load()
   assert.deepEqual(reg2.get(job.id).result, { v: 7 })
   await rm(dir, { recursive: true, force: true })
 })
@@ -110,6 +111,7 @@ test('load() 读回磁盘上的全部作业', async () => {
   await reg.dispose()
   const reg2 = new Registry(dir)
   await reg2.load()
+  await reg2.load() // 幂等：重复读盘不得产生重复条目
   assert.equal(reg2.list().length, 1)
   assert.equal(reg2.list()[0].id, job.id)
   await rm(dir, { recursive: true, force: true })

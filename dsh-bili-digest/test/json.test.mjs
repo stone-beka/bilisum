@@ -1,7 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { readFile, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { compact } from '../src/json.js'
@@ -37,10 +36,11 @@ test('compact 不修改入参', () => {
   assert.equal('b' in input, true)
 })
 
-test('真实作业记录过 compact 后是无损 JSON（F21 守门用例）', async () => {
-  // 这条必须跑**磁盘上的真实作业记录**，而不是合成的对象：
-  // 宿主的无损 JSON 校验发生在运行时出口，合成对象覆盖不到
-  // 「落盘记录里某个字段是 undefined」这个唯一的真实失败路径。
+test('作业快照在内存与磁盘上都是无损 JSON（F21 守门用例）', async () => {
+  // 关键：断言必须看**属性是否存在**，不能只看 JSON.stringify 出来的文本。
+  // JSON.stringify 本来就会丢掉值为 undefined 的键，所以「序列化结果里没有
+  // undefined」这类断言永远成立——它抓不到 compact() 被整个删掉。
+  // 真正的暴露面是内存里那个会被直接交给宿主运行时校验的快照对象。
   const dir = await mkdtemp(join(tmpdir(), 'json-'))
   const { Registry } = await import('../src/jobs.js')
   const reg = new Registry(dir)
@@ -49,13 +49,18 @@ test('真实作业记录过 compact 后是无损 JSON（F21 守门用例）', as
     options: { keep: 1, drop: undefined },
     run: async () => ({ ok: 1, nested: { gone: undefined } }),
   })
-  await reg.wait(job.id, 5)
+  const snap = await reg.wait(job.id, 5)
   await reg.dispose()
 
+  // 1) 内存快照——宿主真正校验的那个对象
+  assert.equal('drop' in snap.options, false, 'options 里的 undefined 键必须已被剥离')
+  assert.equal('gone' in snap.result.nested, false, 'result 里嵌套的 undefined 键必须已被剥离')
+  assert.equal(snap.options.keep, 1)
+
+  // 2) 磁盘记录——持久化路径同样要干净
   const raw = JSON.parse(await readFile(join(dir, 'jobs', job.id, 'job.json'), 'utf8'))
-  const text = JSON.stringify(compact(raw))
-  assert.ok(!text.includes('undefined'), `序列化结果里不应出现 undefined：${text}`)
-  assert.equal(JSON.parse(text).result.ok, 1)
-  assert.equal('gone' in JSON.parse(text).result.nested, false)
+  assert.equal('drop' in raw.options, false)
+  assert.equal('gone' in raw.result.nested, false)
+  assert.equal(raw.result.ok, 1)
   await rm(dir, { recursive: true, force: true })
 })
