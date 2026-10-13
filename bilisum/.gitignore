@@ -1,0 +1,12 @@
+# 大文件与本地产物不入库（模型 240 MB、二进制 78 MB、下载缓存）
+models/
+cache/
+out/
+node_modules/
+
+# 可执行文件由 scripts/fetch-models.ps1 与文档说明获取，不进版本库
+scripts/*.exe
+
+# Cookie（等价于 B 站登录态，绝不入库）
+*.cookie
+cookies.txt

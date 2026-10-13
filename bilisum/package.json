@@ -1,0 +1,9 @@
+{
+    "private": true,
+    "name": "bilisum",
+    "version": "0.1.0",
+    "type": "module",
+    "dependencies": {
+        "sherpa-onnx-node": "^1.13.8"
+    }
+}
