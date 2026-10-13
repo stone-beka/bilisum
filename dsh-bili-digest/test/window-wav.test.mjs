@@ -151,6 +151,15 @@ test('parsePcmWav 对非 PCM16（8bit / float）抛 WAV_MALFORMED', () => {
   assert.throws(() => parsePcmWav(bad), (e) => e.code === 'WAV_MALFORMED')
 })
 
+test('buildPcmWav 默认采样率就是 ASR 要求的 16000（省略第二参也规范）', () => {
+  const b = Buffer.from(buildPcmWav(Int16Array.from([5, 6])))
+  assert.equal(b.readUInt32LE(24), 16000)
+  assert.equal(b.readUInt32LE(28), 32000)
+  assert.equal(b.readUInt16LE(22), 1)
+  assert.equal(b.readUInt16LE(34), 16)
+  assert.equal(b.length, 44 + 4)
+})
+
 test('buildPcmWav 的 data 声明长度与补齐后的尾部字节数一致（逐字节自洽）', () => {
   const out = buildPcmWav(Int16Array.from([1, 2, 3]), 16000)
   const b = Buffer.from(out)
