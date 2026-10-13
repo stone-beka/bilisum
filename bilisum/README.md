@@ -36,19 +36,57 @@ node bilisum.mjs get   "<url>" --cookie <文件>  # 字幕优先，没有就落 
 
 ## 怎么给我 B 站 Cookie
 
-字幕路线需要 `BILI_SESSDATA`。**匿名状态实测字幕命中 0/40**，所以必须登录态。
+字幕路线需要登录态。**匿名状态实测字幕命中 0/40**，所以必须登录。
 
-1. 浏览器打开并登录 B 站
-2. F12 → Application/存储 → Cookies → `https://www.bilibili.com`
-3. 找到 `SESSDATA`，复制它的值
-4. 把它存成一个 Netscape 格式的 cookie 文件，例如 `bilisum/cache/cookies.txt`：
+### 方法 A：复制为 cURL（推荐，不用去找 cookie 那一行）
 
+1. 用 Edge 或 Chrome 打开 <https://www.bilibili.com>，**确认已登录**（右上角有头像）
+2. 按 `F12` 打开开发者工具，切到 **Network / 网络** 标签
+3. **按 `F5` 刷新页面**（不刷新的话请求列表是空的）
+4. 在请求列表里**右键任意一条**发往 `bilibili.com` 的请求
+5. 选 **Copy → Copy as cURL (bash)**
+   （Edge 中文：复制 → 以 cURL 格式复制）
+6. **把整段粘给我** —— 里面已经包含了 cookie
+
+不需要你手动挑字段，我那边会解析。
+
+### 方法 B：只要 SESSDATA
+
+1. `F12` → **Application / 应用程序** 标签（看不到就点标签栏的 `>>`）
+2. 左侧 **Storage → Cookies → https://www.bilibili.com**
+3. 找名字为 **`SESSDATA`** 的那一行，点它
+4. 下方 **Value** 列双击全选复制
+5. 给我 `SESSDATA=<值>`
+
+> 注意：值里的 `%2C` 是 URL 编码的逗号，**原样复制，别解码**。
+
+### 我拿到之后做什么
+
+```powershell
+node scripts/set-cookie.mjs "<你粘贴的内容>"
 ```
-# Netscape HTTP Cookie File
-.bilibili.com	TRUE	/	FALSE	0	SESSDATA	<把值粘这里>
+
+它会：解析 → 调 B 站 `nav` 接口**验证真的登录了** → 才写入 `cache/cookies.txt`（Netscape 格式）。
+
+验证这步很关键：不验证的话，cookie 过期时的症状是"字幕莫名其妙取不到"，你会分不清是**没登录**还是**这个视频本来就没字幕**。校验失败会明确报 `code=-101 账号未登录`，且**不会落盘**。
+
+随时可复查：
+
+```powershell
+node scripts/set-cookie.mjs --check
 ```
 
-> **安全提醒**：`SESSDATA` 等价于你的 B 站登录态。它会以明文存在这个文件里（已被 `.gitignore` 隔离，不会进 git）。用完想失效就去 B 站退出登录。
+### 安全提醒
+
+- `SESSDATA` **等价于你的 B 站登录态**，拿到它等于拿到账号
+- 它只存在 `bilisum/cache/cookies.txt`，已被 `.gitignore` 排除，不会进版本库
+- 想让它失效：B 站 → 设置 → 安全隐私 → **退出所有设备**
+- **不想给完全可以**：`asr` 本地识别路线不需要 cookie（慢一点，但免费、覆盖全部视频）
+
+> 为什么不能我直接读浏览器：Edge/Chrome 的 cookie 库被运行中的浏览器**独占锁定**，
+> 连 `CreateFileW` 全共享模式和 `robocopy /B` 都拿不到（本会话未提权）。
+> 唯一免关浏览器的办法是 Firefox（其 `cookies.sqlite` 不加密也不独占），但本机没装。
+
 
 ## 为什么这么设计（每条都是实测结论）
 
