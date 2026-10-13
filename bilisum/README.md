@@ -2,6 +2,43 @@
 
 不用装插件。`yt-dlp` 取内容、`ffmpeg` 转码、本机 `SenseVoice` 识别，最后**由我（对话里的模型）读文本做总结**。
 
+## 日常怎么用（只记这两条就够）
+
+**一、把链接贴给我就行**——完全不用自己敲命令：
+
+```
+https://www.bilibili.com/video/BV1iz4R6EEFk
+```
+
+或者直接 `BV1iz4R6EEFk`。我会自动选字幕/本地识别，给你重点 + 时间段，并落一份 Markdown。
+
+**二、想自己跑**：
+
+```powershell
+cd C:\Users\23077\Desktop\b速读\bilisum
+node bilisum.mjs get "BV号或链接"      # 结果在 out\<BV号>.md
+```
+
+| 命令 | 用途 | 需要 cookie | 耗时 |
+|---|---|---|---|
+| `get` | **日常用这个**：字幕优先，失败落本地识别 | 有则用 | 秒级 / 3–6 分钟 |
+| `subs` | 只要官方字幕 | 是 | 秒级 |
+| `asr` | 只要本地识别 | 否 | 3–6 分钟 |
+| `probe` | 只看标题/时长/有无字幕 | 否 | 秒级 |
+
+加 `--json` 出全量数据，不加只打摘要。
+
+**Cookie 失效了怎么办**（症状：字幕突然拿不到）：
+
+```powershell
+node scripts/set-cookie.mjs --check     # ✓ 登录有效 / ✗ 未登录
+```
+
+失效了就重新复制一次 cookie 跑 `set-cookie.mjs`（步骤见下文）。
+
+> 模型 230 MB、`sherpa-onnx`、`yt-dlp`、`ffmpeg` 都已就位，**不需要重复安装**。
+> cookie 存在 `cache/cookies.txt`，重启也在。不想给 cookie 也能用——走本地识别即可。
+
 ## 目录
 
 ```
