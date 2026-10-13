@@ -174,33 +174,207 @@ export function parseSrt(text) {
   return out
 }
 
-async function subs(url, cookieFile) {
+// ---------- B 站官方 API 直取字幕 ----------
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36'
+
+/** 把 Netscape cookie 文件转成 Cookie 请求头。 */
+export function cookieHeaderFrom(netscape) {
+  const pairs = []
+  for (const line of String(netscape ?? '').split(/\r?\n/)) {
+    if (!line || line.startsWith('#')) continue
+    const p = line.split('\t')
+    if (p.length >= 7) pairs.push(`${p[5]}=${p[6]}`)
+  }
+  return pairs.length ? pairs.join('; ') : null
+}
+
+function currentCookieHeader() {
+  if (!cookieFile || !existsSync(cookieFile)) return null
+  return cookieHeaderFrom(readFileSync(cookieFile, 'utf8'))
+}
+
+/**
+ * 调 B 站 web 接口。注意：**必须直连**——Node 的 fetch(undici) 默认不读
+ * HTTP_PROXY 环境变量，所以这里是直连，正好符合 B 站的要求。
+ */
+async function biliApi(path) {
+  const ck = currentCookieHeader()
+  const res = await fetch(`https://api.bilibili.com${path}`, {
+    headers: { 'User-Agent': UA, Referer: 'https://www.bilibili.com/', ...(ck ? { Cookie: ck } : {}) },
+  })
+  const text = await res.text()
+  if (!res.ok) throw new Error(`B 站接口 HTTP ${res.status}`)
+  let j
+  // 先看状态码与内容，再解析——风控时返回的是 HTML 错误页，直接 JSON.parse 只会给出误导性的语法错误
+  try { j = JSON.parse(text) } catch { throw new Error(`B 站接口返回非 JSON（HTTP ${res.status}，可能被风控）`) }
+  if (j.code !== 0) throw new Error(`B 站接口 code=${j.code} ${j.message}`)
+  return j.data
+}
+
+/** 从规范化 URL 里取视频标识参数。 */
+export function videoParam(url) {
+  const av = /\/av(\d+)/i.exec(url)
+  if (av) return `aid=${av[1]}`
+  const bv = /\/video\/(BV[0-9A-Za-z]+)/.exec(url)
+  if (bv) return `bvid=${bv[1]}`
+  throw new Error(`无法从 URL 里取到视频标识：${url}`)
+}
+
+/**
+ * 取官方字幕（AI 字幕或投稿字幕），返回带**官方时间戳**的段落。
+ *
+ * 为什么不走 yt-dlp：实测 yt-dlp 对同一视频报"无字幕"，而 player/v2 接口
+ * 明明返回了 `lan=ai-zh`。直接走接口既拿到字，也拿到 from/to 精确时间，
+ * 比识别结果更准更快。
+ */
+async function subsViaApi(url, info) {
+  const param = videoParam(url)
+  const view = await biliApi(`/x/web-interface/view?${param}`)
+  const aid = view.aid, cid = view.cid
+
+  const enriched = {
+    ...info,
+    bvid: view.bvid ?? info.bvid,
+    title: (view.title ?? info.title ?? '').trim() || info.title,
+    duration: Number.isFinite(view.duration) ? view.duration : info.duration,
+    uploader: view.owner?.name ?? info.uploader,
+  }
+
+  // view.subtitle.list —— 投稿字幕（注意：这不代表视频"有字幕"，是 UP 投的材料）
+  const submitted = view?.subtitle?.list ?? []
+  // 偏好简体中文：ai-zh 是 AI 中文，zh-Hans/zh-CN 是投稿中文
+  const prefer = ['ai-zh', 'zh-Hans', 'zh-CN', 'zh', 'ai-en', 'en']
+
+  /**
+   * 下载并解析一条字幕，返回 { segs, covered, bytes, canonical }。
+   *
+   * **为什么整段逻辑这么绕**：B 站的字幕文件不止一份。同一个视频，`player/v2`
+   * 每次会随机返回**不同的** `subtitle_url`，而它们指向**不同的字幕文件**，
+   * 内容长度天差地别。实测同一视频连调 4 次：
+   *
+   *   hash=117166825281470413348692…  → 1119 段，覆盖 2710s（完整）
+   *   hash=113368631412447264608165…  →   30 段，覆盖   93s
+   *   hash=117166825281470413348692…  → 1119 段，覆盖 2710s（完整）
+   *   hash=16560705161614942327d728…  →  138 段，覆盖  306s
+   *
+   * 而且 HTTP 状态码**每次都是 200**、curl 与 node fetch 拿到的长度各自稳定，
+   * 所以光看 res.ok 或用 curl 都发现不了——必须拿视频已知时长校验覆盖度。
+   *
+   * 规律：完整那份的文件名以 **`${aid}${cid}`** 开头（上面 117166825281470 = aid，
+   * 41334869261 = cid）。所以既按这个前缀优先挑，也在覆盖不足时**重新请求
+   * player/v2 换一个文件**（只重试同一个 URL 是没用的，长度是确定的）。
+   */
+  const canonicalPrefix = `${aid}${cid}`
+
+  const fetchOne = async (subUrl) => {
+    const res = await fetch(subUrl, { headers: { 'User-Agent': UA, Referer: 'https://www.bilibili.com/' } })
+    if (!res.ok) throw new Error(`下载字幕内容失败：HTTP ${res.status}`)
+    const text = await res.text()
+    let json
+    try { json = JSON.parse(text) } catch {
+      throw new Error(`字幕内容不是合法 JSON（${text.length} 字节，开头：${text.slice(0, 80)}）`)
+    }
+    const arr = Array.isArray(json?.body) ? json.body : []
+    const segs = arr
+      .map((b) => ({ start: +Number(b.from).toFixed(2), end: +Number(b.to).toFixed(2), text: String(b.content ?? '').trim() }))
+      .filter((s) => s.text)
+    const covered = segs.length ? segs[segs.length - 1].end : 0
+    const name = new URL(subUrl).pathname.split('/').pop() ?? ''
+    return {
+      segs, covered, bytes: text.length, name,
+      canonical: name.startsWith(canonicalPrefix),
+      truncated: Boolean(enriched.duration) && covered < enriched.duration * 0.9,
+    }
+  }
+
+  let best = null, langUsed = null, langDocUsed = null
+  let lastErr = null
+  let sawNoCandidates = false
+  let foreignCount = 0
+  /** 非规范文件的兜底：万一一直遇不到规范文件，至少给一份能用的 */
+  let fallback = null
+  const MAX_TRIES = 16
+  for (let i = 1; i <= MAX_TRIES; i++) {
+    // 每轮都重新要一次 player/v2 —— 换一个文件才可能拿到完整那份
+    let candidates
+    let allCount = 0
+    try {
+      const player = await biliApi(`/x/player/v2?aid=${aid}&cid=${cid}`)
+      const list = player?.subtitle?.subtitles ?? []
+      const all = [...list, ...submitted].filter((c) => c.subtitle_url || c.url)
+      // **只留规范文件**（文件名以 aid+cid 开头）。非规范的那些不仅内容残缺，
+      // 实测拿到的还是**完全不相干视频**的字幕（出现过短剧台词"弟弟就大三了"）。
+      // 在挑之前就筛掉，避免把带宽浪费在垃圾上、也避免选错。
+      candidates = all.filter((c) => {
+        const u = String(c.subtitle_url ?? c.url ?? '')
+        const n = u.split('/').pop()?.split('?')[0] ?? ''
+        return n.startsWith(canonicalPrefix)
+      })
+      allCount = all.length
+    } catch (e) {
+      // 关键：中途失败**不能丢掉已经拿到的 best**，否则"第 1 次拿到完整、
+      // 第 2 次接口抖动"就变成返回空——这正是之前的 bug。
+      lastErr = e
+      process.stderr.write(`[subs] 第 ${i} 次取字幕列表失败：${e.message}\n`)
+      await new Promise((res) => setTimeout(res, 400 * i))
+      continue
+    }
+    if (candidates.length === 0) {
+      // allCount === 0 → 这个视频确实没有字幕轨；allCount > 0 但被筛光 →
+      // 本轮只拿到非规范文件，纯属运气，继续换（**不能**报成"没有字幕"）。
+      if (allCount === 0) sawNoCandidates = true
+      else foreignCount++
+      await new Promise((res) => setTimeout(res, 250 + 60 * i))
+      continue
+    }
+    // 同一语言优先，其次优先规范文件名（aid+cid 开头的那份）
+    const pick = prefer.map((p) => candidates.find((c) => c.lan === p)).find(Boolean) ?? candidates[0]
+    const raw = pick.subtitle_url ?? pick.url ?? ''
+    if (!raw) continue
+    const subUrl = raw.startsWith('//') ? `https:${raw}` : raw
+    let r
+    try { r = await fetchOne(subUrl) } catch (e) {
+      process.stderr.write(`[subs] 第 ${i} 次下载失败：${e.message}\n`)
+      await new Promise((res) => setTimeout(res, 400 * i))
+      continue
+    }
+    const better = !best || r.segs.length > best.segs.length || (r.canonical && !best.canonical)
+    if (better) { best = r; langUsed = pick.lan; langDocUsed = pick.lan_doc ?? null }
+    process.stderr.write(
+      `[subs] 第 ${i} 次：${r.bytes}B → ${r.segs.length} 段，覆盖 ${r.covered}s / ${enriched.duration ?? '?'}s` +
+      `${r.canonical ? '  [规范文件]' : ''}${r.truncated ? '  ← 不完整，换文件' : '  ✓ 完整'}\n`,
+    )
+    if (!r.truncated) break
+    await new Promise((res) => setTimeout(res, 300 * i))
+  }
+
+  if (!best) {
+    const reason = lastErr ? `多次尝试都失败：${lastErr.message}`
+      : sawNoCandidates ? '该视频没有 AI 字幕，也没有投稿字幕'
+      : `${MAX_TRIES} 次都没遇到规范字幕文件（遇到 ${foreignCount} 次非规范文件），换个时间再试`
+    return { ...enriched, mode: 'subs', segments: [], reason }
+  }
+  if (best.truncated) {
+    process.stderr.write(`[subs] 警告：只覆盖 ${best.covered}s / ${enriched.duration}s —— 这份字幕本身就不全，不是下载问题\n`)
+  }
+  return {
+    ...enriched,
+    mode: 'subs',
+    lang: langUsed,
+    langDoc: langDocUsed,
+    segments: best.segs,
+    complete: !best.truncated,
+    reason: best.segs.length ? undefined : '字幕文件里没有内容',
+  }
+}
+
+async function subs(url, cookieFileArg) {
   const info = await probe(url)
-  if (!cookieFile || !existsSync(cookieFile)) {
+  const hasCookie = Boolean(cookieFileArg && existsSync(cookieFileArg))
+  if (!hasCookie) {
     return { ...info, mode: 'subs', segments: [], reason: '未提供 cookie 文件——匿名状态 B 站字幕命中率实测 0/40' }
   }
-  const wanted = ['zh-Hans', 'zh-CN', 'zh', 'ai-zh']
-  const avail = [...info.subs, ...info.autoSubs]
-  if (avail.length === 0) {
-    return { ...info, mode: 'subs', segments: [], reason: '该视频没有可用字幕（登录后仍无）' }
-  }
-  const pick = wanted.find((w) => avail.includes(w)) ?? avail[0]
-  const tmp = join(CACHE, `sub-${info.bvid ?? 'x'}`)
-  rmSync(tmp, { recursive: true, force: true })
-  mkdirSync(tmp, { recursive: true })
-  const r = await run(YTDLP, [
-    '--proxy=', '--skip-download', '--no-playlist', '--no-warnings',
-    '--cookies', cookieFile,
-    '--sub-langs', pick, '--sub-format', 'srt', '--convert-subs', 'srt',
-    '--write-subs', '--write-auto-subs',
-    '-o', join(tmp, 'sub'), info.url,
-  ])
-  if (r.code !== 0) throw new Error(`下载字幕失败：\n${(r.stderr || '').split(/\r?\n/).slice(-6).join('\n')}`)
-  const files = []
-  for (const f of (await import('node:fs')).readdirSync(tmp)) if (f.endsWith('.srt')) files.push(f)
-  if (files.length === 0) return { ...info, mode: 'subs', segments: [], reason: 'yt-dlp 未产出字幕文件' }
-  const raw = readFileSync(join(tmp, files[0]), 'utf8')
-  return { ...info, mode: 'subs', lang: pick, segments: parseSrt(raw) }
+  return withRetry('subs', () => subsViaApi(info.url, info))
 }
 
 // ---------- 音轨 ----------
@@ -351,15 +525,47 @@ function toMarkdown(info, segments) {
 const [cmd, ...rest] = process.argv.slice(2)
 const url = rest.find((a) => !a.startsWith('--'))
 const ci = rest.indexOf('--cookie')
-const cookieFile = ci >= 0 ? rest[ci + 1] : null
+const wantJson = rest.includes('--json')
+// 没显式给 --cookie 时，自动用 scripts/set-cookie.mjs 存下来的那份。
+// 否则会出现"明明配好了 cookie，subs 却还说自己没 cookie"的荒唐情况。
+const DEFAULT_COOKIE = join(CACHE, 'cookies.txt')
+const cookieFile =
+  (ci >= 0 ? rest[ci + 1] : null) ?? (existsSync(DEFAULT_COOKIE) ? DEFAULT_COOKIE : null)
+
+/**
+ * 默认只打摘要。
+ * 一份 45 分钟视频的官方字幕有几百段，全量 JSON 打到终端没有意义（而且刷屏），
+ * 需要全量时显式加 --json。
+ */
+function report(result) {
+  if (wantJson) { console.log(JSON.stringify(result, null, 2)); return }
+  const segs = result.segments ?? []
+  const chars = segs.reduce((n, s) => n + s.text.length, 0)
+  const last = segs.length ? segs[segs.length - 1].end : 0
+  const hhmmss = (s) => {
+    const t = Math.max(0, Math.round(s))
+    return `${String(Math.floor(t / 3600)).padStart(2, '0')}:${String(Math.floor((t % 3600) / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`
+  }
+  console.log(`标题   ${result.title}`)
+  console.log(`UP     ${result.uploader ?? '-'}   BV ${result.bvid ?? '-'}   时长 ${hhmmss(result.duration ?? last)}`)
+  console.log(`来源   ${result.mode === 'subs' ? `B 站官方字幕（${result.langDoc ?? result.lang ?? '?'}）` : '本地 SenseVoice 识别'}`)
+  console.log(`结果   ${segs.length} 段 / ${chars} 字 / 覆盖到 ${hhmmss(last)}`)
+  if (result.reason) console.log(`原因   ${result.reason}`)
+  if (result.markdown) console.log(`文件   ${result.markdown}`)
+  if (segs.length) {
+    console.log(`\n开头三段：`)
+    for (const s of segs.slice(0, 3)) console.log(`  [${hhmmss(s.start)}] ${s.text}`)
+    console.log(`（完整内容见 Markdown 文件；要全量 JSON 加 --json）`)
+  }
+}
 
 try {
   if (cmd === 'probe') {
-    console.log(JSON.stringify(await probe(url), null, 2))
+    report(await probe(url))
   } else if (cmd === 'subs') {
-    console.log(JSON.stringify(await subs(url, cookieFile), null, 2))
+    report(await subs(url, cookieFile))
   } else if (cmd === 'asr') {
-    console.log(JSON.stringify(await transcribe(url), null, 2))
+    report(await transcribe(url))
   } else if (cmd === 'get') {
     let r = await subs(url, cookieFile)
     if (!r.segments.length) {
@@ -370,12 +576,12 @@ try {
     const dest = join(OUT, `${r.bvid ?? 'video'}.md`)
     writeFileSync(dest, md, 'utf8')
     process.stderr.write(`已写出：${dest}\n`)
-    console.log(JSON.stringify({ ...r, markdown: dest, chars: r.segments.reduce((n, s) => n + s.text.length, 0) }, null, 2))
+    report({ ...r, markdown: dest })
   } else {
-    console.error('用法：node bilisum.mjs <probe|subs|asr|get> <url> [--cookie <file>]')
-    process.exit(2)
+    console.error('用法：node bilisum.mjs <probe|subs|asr|get> <url> [--cookie <file>] [--json]')
+    process.exitCode = 2
   }
 } catch (e) {
   console.error(`错误：${e.message}`)
-  process.exit(1)
+  process.exitCode = 1
 }
