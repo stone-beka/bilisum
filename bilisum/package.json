@@ -3,6 +3,9 @@
     "name": "bilisum",
     "version": "0.1.0",
     "type": "module",
+    "scripts": {
+        "test": "node --test"
+    },
     "dependencies": {
         "sherpa-onnx-node": "^1.13.8"
     }

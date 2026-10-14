@@ -10,11 +10,18 @@
  *  - ffmpeg 的 WAV 头不规范（插 LIST/INFO/fact，data 在 offset 78），所以走**裸 PCM**
  *  - 长音频必须分窗：SenseVoice 整段吃会静默返回空文本、退出码仍是 0
  *
+ * 默认产出策略（2026-10-13 起，用户指定）：
+ *   **唯一交付物是《速读稿》，只含两节：30 秒速读 + 重点提炼。**
+ *   其余一律默认不产出——中文全文稿、原始转写、名词校正表、关键数字表、方法说明，用户都不看。
+ *   所以本工具默认不再往 out/ 写转写：转写降级为中间产物，落 cache/<BV>.transcript.md，
+ *   供会话里的模型读完写《速读稿》。要单独留一份正式转写，显式加 --full。
+ *
  * 用法：
- *   node bilisum.mjs probe   <url> [--cookie <file>]
- *   node bilisum.mjs subs    <url> --cookie <file>
- *   node bilisum.mjs asr     <url>
- *   node bilisum.mjs get     <url> [--cookie <file>]   # 字幕优先，失败落 ASR
+ *   node bilisum.mjs probe   <url> [--cookie <file>]   # 只看标题/时长/有无字幕
+ *   node bilisum.mjs subs    <url> --cookie <file>     # 只要官方字幕
+ *   node bilisum.mjs asr     <url>                     # 只要本地识别
+ *   node bilisum.mjs get     <url> [--cookie <file>]    # 字幕优先，失败落 ASR（日常用这个）
+ *   # 默认：转写落 cache/，只在终端打摘要；--full 写正式转写到 out/，--preview 打开头三段
  */
 
 import { spawn, spawnSync } from 'node:child_process'
@@ -136,12 +143,20 @@ async function probe(url) {
   }
   let info
   try { info = JSON.parse(r.stdout) } catch { throw new Error('yt-dlp 输出不是合法 JSON（可能是风控错误页）') }
+  // 基本信息（粉丝数/播放量/发布时间…）走 B 站公开接口补，yt-dlp 没有这些字段。
+  // 挂了也不影响探测本身——速读稿会少基本信息，但流程继续。
+  // 注意：yt-dlp 的 id 带 `_pN` 后缀，必须先剥掉才是合法 bvid（见 bareBvid）。
+  const rawId = info.id ?? null
+  const bvid = bareBvid(rawId) ?? rawId
+  const meta = await metaFromApi(bvid).catch(() => null)
   return {
     url: normalized,
-    bvid: info.id ?? null,
+    bvid,
+    page: pageOf(rawId),
     title: (info.title ?? '').trim() || info.id,
     duration: Number.isFinite(info.duration) ? info.duration : null,
-    uploader: info.uploader ?? null,
+    uploader: meta?.author ?? info.uploader ?? null,
+    meta,
     subs: Object.keys(info.subtitles ?? {}),
     autoSubs: Object.keys(info.automatic_captions ?? {}),
     audioFormats: (info.formats ?? [])
@@ -221,6 +236,151 @@ export function videoParam(url) {
 }
 
 /**
+ * yt-dlp 对 B 站给出的 `info.id` 是 `BV<10 位>_p<页码>`——**单 P 视频也带 `_p1`**。
+ *
+ * 这个带页码的串**不是合法 bvid**：`/x/web-interface/view?bvid=BV…_p1` 会直接
+ * `code=-400 请求错误`。而 `b23.tv` 短链（手机分享出来的常态）URL 里没有 BV，
+ * 只能靠 yt-dlp 的这个 id 兜底，于是整条链路会同时坏两处：
+ *   1. 视频基本信息（作者粉丝数 / 播放量 / 发布时间…）**全部拿不到**；
+ *   2. 官方字幕的兜底请求也 400，被迫退回慢得多的本地 ASR。
+ *
+ * 这里只做一件事：剥掉 `_pN`。BV body **大小写敏感，一个字都不动**。
+ * 取不到合法 BV 时返回 null，交调用方决定怎么降级。
+ */
+export function bareBvid(raw) {
+  const m = /^([Bb][Vv][0-9A-Za-z]{10})(?:_p\d+)?$/.exec(String(raw ?? '').trim())
+  return m ? m[1] : null
+}
+
+/** 从 `BV…_p3` 里取页码；取不到（单 P 的正常形态）算 1。 */
+export function pageOf(raw) {
+  const m = /_p(\d+)\s*$/.exec(String(raw ?? '').trim())
+  return m ? Number(m[1]) : 1
+}
+
+// ---------- 视频基本信息（速读稿必需件）----------
+/**
+ * 2026-10-14 用户明确要求：**以后每份速读都要带上视频基本信息**——
+ * 作者名、粉丝数、发布时间、评论数、播放量等，用户靠这些判断这条视频可不可信。
+ *
+ * 为什么必须单独取：yt-dlp 只给标题 / UP 名 / 时长，**给不了**粉丝数、播放量、
+ * 评论数、发布时间。这些全在 B 站公开 web 接口里。
+ *
+ * 公开接口、**不需要 cookie**；任何一步失败都只降级（返回 null 或局部缺字段），
+ * 绝不因为"粉丝数拿不到"把整条速读搞挂。
+ */
+const _metaCache = new Map()
+
+async function metaFromApi(bvid) {
+  bvid = bareBvid(bvid) ?? bvid   // 防呆：任何入口传进来都先规整一次
+  if (!bvid) return null
+  if (_metaCache.has(bvid)) return _metaCache.get(bvid)
+  let view
+  try {
+    view = await withRetry('meta/view', () => biliApi(`/x/web-interface/view?bvid=${encodeURIComponent(bvid)}`), { attempts: 3 })
+  } catch (e) {
+    process.stderr.write(`[meta] 取视频信息失败（速读稿将缺基本信息）：${String(e.message).split('\n')[0]}\n`)
+    return null
+  }
+  const o = view?.owner ?? {}
+  let fans = null
+  if (o.mid) {
+    try {
+      const rel = await withRetry('meta/relation', () => biliApi(`/x/relation/stat?vmid=${o.mid}`), { attempts: 3 })
+      fans = Number.isFinite(rel?.follower) ? rel.follower : null
+    } catch { /* 粉丝数拿不到不影响其余字段 */ }
+  }
+  const s = view?.stat ?? {}
+  const meta = {
+    bvid: view?.bvid ?? bvid,
+    aid: view?.aid ?? null,
+    cid: view?.cid ?? null,
+    title: (view?.title ?? '').trim() || null,
+    author: o.name ?? null,
+    authorMid: o.mid ?? null,
+    authorFans: fans,
+    pubdate: Number.isFinite(view?.pubdate) ? view.pubdate : null,
+    duration: Number.isFinite(view?.duration) ? view.duration : null,
+    view: Number.isFinite(s.view) ? s.view : null,
+    like: Number.isFinite(s.like) ? s.like : null,
+    coin: Number.isFinite(s.coin) ? s.coin : null,
+    favorite: Number.isFinite(s.favorite) ? s.favorite : null,
+    danmaku: Number.isFinite(s.danmaku) ? s.danmaku : null,
+    reply: Number.isFinite(s.reply) ? s.reply : null,
+    share: Number.isFinite(s.share) ? s.share : null,
+    desc: (view?.desc ?? '').trim(),
+    // B 站官方给这条视频挂的提示（例：「个人观点，仅供参考」），是现成的可信度信号
+    argueMsg: (view?.argue_info?.argue_msg ?? '').trim(),
+  }
+  _metaCache.set(bvid, meta)
+  return meta
+}
+
+/** 秒 → HH:MM:SS。 */
+function hhmmss(s) {
+  const t = Math.max(0, Math.round(Number(s) || 0))
+  return `${String(Math.floor(t / 3600)).padStart(2, '0')}:${String(Math.floor((t % 3600) / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`
+}
+
+/** 数字口语化：12345 → 1.2 万。给人看的播放量/粉丝数。 */
+function fmtCount(n) {
+  if (!Number.isFinite(n)) return '未知'
+  const abs = Math.abs(n)
+  if (abs >= 1e8) return `${(n / 1e8).toFixed(abs >= 1e9 ? 0 : 1)} 亿`
+  if (abs >= 1e4) return `${(n / 1e4).toFixed(abs >= 1e5 ? 0 : 1)} 万`
+  return String(n)
+}
+
+/** UNIX 秒 → 北京时间字符串（用户就在 Asia/Shanghai）。固定 +8 偏移，不依赖 ICU。 */
+function fmtDate(unixSec) {
+  if (!Number.isFinite(unixSec) || unixSec <= 0) return '未知'
+  const p = (x) => String(x).padStart(2, '0')
+  const bj = new Date(unixSec * 1000 + 8 * 3600 * 1000)
+  return `${bj.getUTCFullYear()}-${p(bj.getUTCMonth() + 1)}-${p(bj.getUTCDate())} ${p(bj.getUTCHours())}:${p(bj.getUTCMinutes())}`
+}
+
+/** 距今多久。「刚发 2 小时」和「发了 3 年」对可信度判断完全是两件事。 */
+function fmtAgo(unixSec, nowMs = Date.now()) {
+  if (!Number.isFinite(unixSec) || unixSec <= 0) return ''
+  const s = Math.max(0, Math.round(nowMs / 1000 - unixSec))
+  if (s < 3600) return `${Math.max(1, Math.round(s / 60))} 分钟前`
+  if (s < 86400) return `${Math.round(s / 3600)} 小时前`
+  if (s < 86400 * 30) return `${Math.round(s / 86400)} 天前`
+  if (s < 86400 * 365) return `${Math.round(s / (86400 * 30))} 个月`
+  return `${(s / (86400 * 365)).toFixed(1)} 年`
+}
+
+/**
+ * 基本信息块 → [[字段, 值]]。终端输出、转写文件头、速读稿共用同一份口径，
+ * 避免"终端显示的粉丝数和速读稿里写的不一样"。
+ */
+function metaBlock(meta) {
+  if (!meta) return null
+  const stat = [
+    `播放 ${fmtCount(meta.view)}`,
+    `点赞 ${fmtCount(meta.like)}`,
+    `投币 ${fmtCount(meta.coin)}`,
+    `收藏 ${fmtCount(meta.favorite)}`,
+    `评论 ${fmtCount(meta.reply)}`,
+    `弹幕 ${fmtCount(meta.danmaku)}`,
+    `分享 ${fmtCount(meta.share)}`,
+  ].join(' · ')
+  const rows = [
+    ['标题', meta.title ?? '未知'],
+    ['作者', `${meta.author ?? '未知'}（粉丝 ${fmtCount(meta.authorFans)}）`],
+    ['发布', meta.pubdate ? `${fmtDate(meta.pubdate)}（${fmtAgo(meta.pubdate)}）` : '未知'],
+    ['时长', meta.duration ? hhmmss(meta.duration) : '未知'],
+    ['数据', stat],
+    ['链接', `https://www.bilibili.com/video/${meta.bvid}`],
+  ]
+  // 简介里带换行，直接塞进 Markdown 列表会把列表打断（实测），先压成一行
+  const desc = (meta.desc ?? '').replace(/\s*\n+\s*/g, ' ').trim()
+  if (desc) rows.push(['简介', desc.length > 120 ? `${desc.slice(0, 120)}…` : desc])
+  if (meta.argueMsg) rows.push(['官方提示', meta.argueMsg])
+  return rows
+}
+
+/**
  * 取官方字幕（AI 字幕或投稿字幕），返回带**官方时间戳**的段落。
  *
  * 为什么不走 yt-dlp：实测 yt-dlp 对同一视频报"无字幕"，而 player/v2 接口
@@ -228,9 +388,20 @@ export function videoParam(url) {
  * 比识别结果更准更快。
  */
 async function subsViaApi(url, info) {
-  const param = videoParam(url)
+  // b23.tv 短链 / 带参数的播放页在 URL 里**没有** BV 号，但 yt-dlp 已经把真 BV 解析出来了，
+  // 所以解析不出标识时用 info.bvid 兜底——否则短链会在这里直接抛错。
+  const param = (() => {
+    try { return videoParam(url) } catch {
+      if (info?.bvid) return `bvid=${info.bvid}`
+      throw new Error(`无法从 URL 里取到视频标识：${url}`)
+    }
+  })()
   const view = await biliApi(`/x/web-interface/view?${param}`)
-  const aid = view.aid, cid = view.cid
+  const aid = view.aid
+  // 多 P 视频：view 顶层给的是第 1 P，选看的那 P 的 cid 在 pages[] 里。
+  // 单 P 时 pages[0].cid === view.cid，行为与从前完全一致。
+  const page = Number.isFinite(info?.page) ? info.page : 1
+  const cid = (Array.isArray(view.pages) ? view.pages[page - 1]?.cid : null) ?? view.cid
 
   const enriched = {
     ...info,
@@ -498,20 +669,34 @@ async function transcribe(url) {
 }
 
 // ---------- 输出 ----------
-function toMarkdown(info, segments) {
+function toMarkdown(info, segments, { intermediate = false } = {}) {
   const total = segments.length ? segments[segments.length - 1].end : (info.duration ?? 0)
   const hhmm = (s) => {
     const t = Math.max(0, Math.round(s))
     return `${String(Math.floor(t / 3600)).padStart(2, '0')}:${String(Math.floor((t % 3600) / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`
   }
-  const link = (s) => `https://www.bilibili.com/video/${info.bvid}?t=${Math.floor(s)}`
+  const pageQ = Number(info.page) > 1 ? `p=${info.page}&` : ''
+  const link = (s) => `https://www.bilibili.com/video/${info.bvid}?${pageQ}t=${Math.floor(s)}`
+  // 基本信息放文件最前面：这份文件是喂给模型的中间产物，模型据此写速读稿。
+  // 写在这里而不是靠模型自己想起来去查——模型只读得到这个文件。
+  const metaRows = metaBlock(info.meta)
+  const infoLines = metaRows
+    ? metaRows.map(([k, v]) => `- ${k}：${v}`)
+    : [
+        `- 视频：<https://www.bilibili.com/video/${info.bvid}>`,
+        `- 时长：${hhmm(total)}`,
+        info.uploader ? `- UP：${info.uploader}` : null,
+        '- ⚠️ 基本信息（粉丝数/播放量/发布时间）没取到，速读稿里要写明"数据未取到"',
+      ].filter(Boolean)
   const lines = [
     `# ${info.title}`,
     '',
-    `- 视频：<https://www.bilibili.com/video/${info.bvid}>`,
-    `- 时长：${hhmm(total)}`,
-    info.uploader ? `- UP：${info.uploader}` : null,
+    '## 视频基本信息',
+    '',
+    ...infoLines,
+    '',
     `- 转写来源：${info.mode === 'subs' ? `B 站字幕（${info.lang ?? '?'}）` : '本地 SenseVoice'}`,
+    intermediate ? '- 用途：中间产物（喂给模型做速读），**非交付物**' : null,
     '',
     '## 完整转写（带时间）',
     '',
@@ -526,6 +711,8 @@ const [cmd, ...rest] = process.argv.slice(2)
 const url = rest.find((a) => !a.startsWith('--'))
 const ci = rest.indexOf('--cookie')
 const wantJson = rest.includes('--json')
+const wantFull = rest.includes('--full')       // 把转写写成正式文件（进 out/）；默认不写
+const wantPreview = rest.includes('--preview') // 在终端打开头三段；默认不打
 // 没显式给 --cookie 时，自动用 scripts/set-cookie.mjs 存下来的那份。
 // 否则会出现"明明配好了 cookie，subs 却还说自己没 cookie"的荒唐情况。
 const DEFAULT_COOKIE = join(CACHE, 'cookies.txt')
@@ -536,30 +723,37 @@ const cookieFile =
  * 默认只打摘要。
  * 一份 45 分钟视频的官方字幕有几百段，全量 JSON 打到终端没有意义（而且刷屏），
  * 需要全量时显式加 --json。
+ * 同理，开头三段预览默认也不打（用户明确说不读这些），要看加 --preview。
  */
 function report(result) {
   if (wantJson) { console.log(JSON.stringify(result, null, 2)); return }
   const segs = result.segments ?? []
   const chars = segs.reduce((n, s) => n + s.text.length, 0)
   const last = segs.length ? segs[segs.length - 1].end : 0
-  const hhmmss = (s) => {
-    const t = Math.max(0, Math.round(s))
-    return `${String(Math.floor(t / 3600)).padStart(2, '0')}:${String(Math.floor((t % 3600) / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`
+  // 基本信息优先打全（用户判断可信度就靠这些）；拿不到时退回老的三行式，不装样子。
+  const rows = metaBlock(result.meta)
+  if (rows) {
+    for (const [k, v] of rows) console.log(`${k.padEnd(5, '　')} ${v}`)
+  } else {
+    console.log(`标题   ${result.title}`)
+    console.log(`UP     ${result.uploader ?? '-'}   BV ${result.bvid ?? '-'}   时长 ${hhmmss(result.duration ?? last)}`)
   }
-  console.log(`标题   ${result.title}`)
-  console.log(`UP     ${result.uploader ?? '-'}   BV ${result.bvid ?? '-'}   时长 ${hhmmss(result.duration ?? last)}`)
-  console.log(`来源   ${result.mode === 'subs' ? `B 站官方字幕（${result.langDoc ?? result.lang ?? '?'}）` : '本地 SenseVoice 识别'}`)
+  console.log(`来源   ${result.mode === 'subs' ? `B 站官方字幕（${result.langDoc ?? result.lang ?? '?'}）` : result.mode === 'asr' ? '本地 SenseVoice 识别' : '仅探测（未取转写）'}`)
   console.log(`结果   ${segs.length} 段 / ${chars} 字 / 覆盖到 ${hhmmss(last)}`)
   if (result.reason) console.log(`原因   ${result.reason}`)
   if (result.markdown) console.log(`文件   ${result.markdown}`)
-  if (segs.length) {
+  if (wantPreview && segs.length) {
     console.log(`\n开头三段：`)
     for (const s of segs.slice(0, 3)) console.log(`  [${hhmmss(s.start)}] ${s.text}`)
     console.log(`（完整内容见 Markdown 文件；要全量 JSON 加 --json）`)
   }
 }
 
-try {
+/**
+ * 只有「直接运行」时才走 CLI。被 `import`（单元测试）时什么都不做——
+ * 否则会打出用法、还把 process.exitCode 改成 2，让测试拿到假的失败退出码。
+ */
+if (import.meta.main) try {
   if (cmd === 'probe') {
     report(await probe(url))
   } else if (cmd === 'subs') {
@@ -572,13 +766,18 @@ try {
       process.stderr.write(`字幕不可用（${r.reason}），转本地识别…\n`)
       r = await transcribe(url)
     }
-    const md = toMarkdown(r, r.segments)
-    const dest = join(OUT, `${r.bvid ?? 'video'}.md`)
-    writeFileSync(dest, md, 'utf8')
-    process.stderr.write(`已写出：${dest}\n`)
+    const name = r.bvid ?? 'video'
+    // 默认产出策略（2026-10-13 起）：唯一交付物是《速读稿》（30 秒速读 + 重点提炼），
+    // 由会话里的模型读转写后写进 out/。转写只是喂给模型的中间产物，默认落 cache/，
+    // 不写 out/、不进交付。要单独留一份正式转写时加 --full。
+    const dest = wantFull ? join(OUT, `${name}.md`) : join(CACHE, `${name}.transcript.md`)
+    writeFileSync(dest, toMarkdown(r, r.segments, { intermediate: !wantFull }), 'utf8')
+    process.stderr.write(
+      wantFull ? `已写出：${dest}\n` : `已写出中间产物：${dest}（要正式转写加 --full）\n`,
+    )
     report({ ...r, markdown: dest })
   } else {
-    console.error('用法：node bilisum.mjs <probe|subs|asr|get> <url> [--cookie <file>] [--json]')
+    console.error('用法：node bilisum.mjs <probe|subs|asr|get> <url> [--cookie <file>] [--json] [--full] [--preview]')
     process.exitCode = 2
   }
 } catch (e) {
