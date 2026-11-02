@@ -32,7 +32,7 @@
 
 import { spawn, spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -144,6 +144,17 @@ async function probe(url) {
     // B 站风控返 412 + HTML 错误页，不是 JSON——先看状态码再解析
     if (/412|Precondition Failed/i.test(r.stderr || '')) {
       throw new Error(`B 站风控拦截（HTTP 412）。通常是代理问题——B 站必须直连。\n${tail}`)
+    }
+    // 视频被删/设为私密/仅会员可见时，yt-dlp 抛的是 KeyError('bvid') 这类内部错误，
+    // 对用户完全不可读。这里翻译成人话，并给出下一步。
+    if (/KeyError\('bvid'\)|Unable to extract|not available|404|不存在|已删除/i.test(r.stderr || '')) {
+      throw new Error(
+        `取不到这条视频。常见原因：\n` +
+        `  · 视频已被删除 / 设为私密 / 仅限会员或充电专属\n` +
+        `  · BV 号抄错（注意大小写，body 区分大小写）\n` +
+        `  · yt-dlp 版本过旧，B 站改了接口（跑 node bilisum.mjs doctor 看环境）\n` +
+        `原始报错：${tail.split('\n')[0]}`,
+      )
     }
     throw new Error(`yt-dlp 探测失败（退出码 ${r.code}）：\n${tail}`)
   }
@@ -623,26 +634,19 @@ async function subsViaApi(url, info) {
   let lastErr = null
   let sawNoCandidates = false
   let foreignCount = 0
-  /** 非规范文件的兜底：万一一直遇不到规范文件，至少给一份能用的 */
-  let fallback = null
   const MAX_TRIES = 16
+  /** 连续这么多轮只看见"非规范文件"就放弃——那些是别的视频的字幕，等下去也没用 */
+  const MAX_FOREIGN_ROUNDS = 5
+  let foreignRounds = 0
+  /** 已经下载过的字幕 URL —— 同一份文件不再重复下（player/v2 经常重复返回同一批） */
+  const triedUrls = new Set()
   for (let i = 1; i <= MAX_TRIES; i++) {
     // 每轮都重新要一次 player/v2 —— 换一个文件才可能拿到完整那份
-    let candidates
-    let allCount = 0
+    let all = []
     try {
       const player = await biliApi(`/x/player/v2?aid=${aid}&cid=${cid}`)
       const list = player?.subtitle?.subtitles ?? []
-      const all = [...list, ...submitted].filter((c) => c.subtitle_url || c.url)
-      // **只留规范文件**（文件名以 aid+cid 开头）。非规范的那些不仅内容残缺，
-      // 实测拿到的还是**完全不相干视频**的字幕（出现过短剧台词"弟弟就大三了"）。
-      // 在挑之前就筛掉，避免把带宽浪费在垃圾上、也避免选错。
-      candidates = all.filter((c) => {
-        const u = String(c.subtitle_url ?? c.url ?? '')
-        const n = u.split('/').pop()?.split('?')[0] ?? ''
-        return n.startsWith(canonicalPrefix)
-      })
-      allCount = all.length
+      all = [...list, ...submitted].filter((c) => c.subtitle_url || c.url)
     } catch (e) {
       // 关键：中途失败**不能丢掉已经拿到的 best**，否则"第 1 次拿到完整、
       // 第 2 次接口抖动"就变成返回空——这正是之前的 bug。
@@ -651,39 +655,78 @@ async function subsViaApi(url, info) {
       await new Promise((res) => setTimeout(res, 400 * i))
       continue
     }
-    if (candidates.length === 0) {
-      // allCount === 0 → 这个视频确实没有字幕轨；allCount > 0 但被筛光 →
-      // 本轮只拿到非规范文件，纯属运气，继续换（**不能**报成"没有字幕"）。
-      if (allCount === 0) sawNoCandidates = true
-      else foreignCount++
+    if (all.length === 0) {
+      // 确实没有任何字幕轨（AI 或投稿）
+      sawNoCandidates = true
       await new Promise((res) => setTimeout(res, 250 + 60 * i))
       continue
     }
-    // 同一语言优先，其次优先规范文件名（aid+cid 开头的那份）
-    const pick = prefer.map((p) => candidates.find((c) => c.lan === p)).find(Boolean) ?? candidates[0]
-    const raw = pick.subtitle_url ?? pick.url ?? ''
-    if (!raw) continue
-    const subUrl = raw.startsWith('//') ? `https:${raw}` : raw
+
+    /**
+     * **只认规范文件**：文件名以 `${aid}${cid}` 开头。
+     *
+     * 2026-11-02 差点改坏，记一笔：一度觉得这条规则太严、会误杀"明明有字幕的视频"
+     * （BV1EYx56MEtK 返回的 ai-zh 文件覆盖度能到 357s/434s，看着挺完整），于是改成
+     * 不筛只排序。结果做出来的速读稿内容**完全是另一个视频的**（山姆超市探店），
+     * 也就是说非规范文件不只是残缺，而是**别的视频的字幕**。覆盖度校验挡不住它
+     * （那个视频恰好也是 6 分半）。所以这条硬筛必须留着。
+     */
+    const canonical = all.filter((c) => {
+      const u = String(c.subtitle_url ?? c.url ?? '')
+      const n = u.split('/').pop()?.split('?')[0] ?? ''
+      return n.startsWith(canonicalPrefix)
+    })
+    if (canonical.length === 0) {
+      // 只有非规范文件：没有继续等的价值，早点交回本地识别
+      foreignCount++
+      foreignRounds++
+      if (foreignRounds >= MAX_FOREIGN_ROUNDS) break
+      await new Promise((res) => setTimeout(res, 250 + 60 * i))
+      continue
+    }
+    foreignRounds = 0
+
+    // 规范文件里按语言偏好挑（ai-zh 最前），同一 URL 不重复下
+    const ranked = canonical
+      .map((c) => {
+        const raw = String(c.subtitle_url ?? c.url ?? '')
+        const u = raw.startsWith('//') ? `https:${raw}` : raw
+        const rank = prefer.indexOf(c.lan)
+        return { c, u, rank: rank < 0 ? 99 : rank }
+      })
+      .filter((x) => x.u && !triedUrls.has(x.u))
+      .sort((a, b) => a.rank - b.rank)
+
+    if (ranked.length === 0) {
+      // 规范文件都试过了，本轮没新东西
+      await new Promise((res) => setTimeout(res, 250 + 60 * i))
+      continue
+    }
+
+    const pick = ranked[0]
+    triedUrls.add(pick.u)
     let r
-    try { r = await fetchOne(subUrl) } catch (e) {
+    try { r = await fetchOne(pick.u) } catch (e) {
       process.stderr.write(`[subs] 第 ${i} 次下载失败：${e.message}\n`)
       await new Promise((res) => setTimeout(res, 400 * i))
       continue
     }
-    const better = !best || r.segs.length > best.segs.length || (r.canonical && !best.canonical)
-    if (better) { best = r; langUsed = pick.lan; langDocUsed = pick.lan_doc ?? null }
+    const better = !best || r.segs.length > best.segs.length
+    if (better) { best = r; langUsed = pick.c.lan; langDocUsed = pick.c.lan_doc ?? null }
     process.stderr.write(
       `[subs] 第 ${i} 次：${r.bytes}B → ${r.segs.length} 段，覆盖 ${r.covered}s / ${enriched.duration ?? '?'}s` +
-      `${r.canonical ? '  [规范文件]' : ''}${r.truncated ? '  ← 不完整，换文件' : '  ✓ 完整'}\n`,
+      `${r.truncated ? '  ← 不完整，换文件' : '  ✓ 完整'}\n`,
     )
     if (!r.truncated) break
+    // 已经试了 8 轮还只有残缺的：别无限耗下去，用手上最好的那份（返回时会警告）
+    if (i >= 8) break
     await new Promise((res) => setTimeout(res, 300 * i))
   }
 
   if (!best) {
     const reason = lastErr ? `多次尝试都失败：${lastErr.message}`
       : sawNoCandidates ? '该视频没有 AI 字幕，也没有投稿字幕'
-      : `${MAX_TRIES} 次都没遇到规范字幕文件（遇到 ${foreignCount} 次非规范文件），换个时间再试`
+        : `没有可用的规范字幕文件（只返回了其他视频的字幕 ${foreignCount} 轮），改用本地识别`
     return { ...enriched, mode: 'subs', segments: [], reason }
   }
   if (best.truncated) {
@@ -881,6 +924,86 @@ export function toMarkdown(info, segments, { intermediate = false, comments = nu
   )
   return lines.join('\n')
 }
+// ---------- doctor（安装自检）----------
+/**
+ * 首次安装最容易卡在"到底缺什么"：缺二进制、缺模型、cookie 过期——
+ * 三种情况的表现完全一样：跑起来就一句看不懂的报错。
+ * doctor 把能查的都查一遍，每一项给一条能照做的修复命令。
+ */
+const dispWidth = (s) => [...s].reduce((n, ch) => n + (/[\u2e80-\u9fff\uff00-\uffef\u3000-\u303f]/.test(ch) ? 2 : 1), 0)
+const padDisp = (s, n) => s + ' '.repeat(Math.max(0, n - dispWidth(s)))
+
+async function doctor() {
+  const rows = []
+  const add = (mark, label, detail) => rows.push({ mark, label, detail })
+  let blocking = 0
+
+  const major = Number(process.versions.node.split('.')[0])
+  if (major >= 20) add('✓', `Node ${process.versions.node}`, '满足 >= 20')
+  else { add('✗', `Node ${process.versions.node}`, '需要 >= 20 → https://nodejs.org 装 LTS'); blocking++ }
+
+  for (const [label, p, hint] of [
+    ['yt-dlp', YTDLP, '取视频信息与音轨'],
+    ['ffmpeg', FFMPEG, '音轨解成裸 PCM'],
+  ]) {
+    if (existsSync(p)) add('✓', label, `${hint} · ${p.slice(HERE.length + 1)}`)
+    else { add('✗', label, `缺失 ${p.slice(HERE.length + 1)} → pwsh scripts/fetch-models.ps1`); blocking++ }
+  }
+
+  for (const [label, p, bytes] of [
+    ['SenseVoice 模型', MODEL, 239233841],
+    ['SenseVoice tokens', TOKENS, 315894],
+    ['Silero VAD', VAD, 1807522],
+  ]) {
+    if (!existsSync(p)) { add('✗', label, '缺失 → pwsh scripts/fetch-models.ps1'); blocking++; continue }
+    const size = statSync(p).size
+    if (size === bytes) add('✓', label, `${(bytes / 1048576).toFixed(1)} MB，大小对得上`)
+    else { add('✗', label, `只有 ${size} B（应为 ${bytes} B），疑似下到一半 → 重跑 fetch-models.ps1`); blocking++ }
+  }
+
+  const sherpaDir = join(HERE, 'node_modules', 'sherpa-onnx-node')
+  if (existsSync(sherpaDir)) add('✓', 'sherpa-onnx-node', '本地 ASR 的 native 依赖已装')
+  else add('!', 'sherpa-onnx-node', '未安装：只有走本地 ASR 才需要 → npm install')
+
+  try {
+    mkdirSync(CACHE, { recursive: true })
+    const probeFile = join(CACHE, '.doctor-write-test')
+    writeFileSync(probeFile, 'ok')
+    rmSync(probeFile)
+    add('✓', 'cache 可写', CACHE.slice(HERE.length + 1))
+  } catch (e) {
+    add('✗', 'cache 不可写', `${CACHE}：${e.message}`)
+    blocking++
+  }
+
+  if (!cookieFile || !existsSync(cookieFile)) {
+    add('!', 'cookie', '没有 → 也能跑（走本地 ASR；评论只有前 3 条）；想要字幕：node login.mjs')
+  } else {
+    const header = currentCookieHeader()
+    if (!header) {
+      add('!', 'cookie', `文件在但解析不出 SESSDATA：${cookieFile}`)
+    } else {
+      try {
+        const nav = await biliApi('/x/web-interface/nav', header)
+        if (nav?.isLogin) add('✓', 'cookie', `已登录：${nav.uname ?? '(匿名)'}`)
+        else add('!', 'cookie', '未登录或已过期 → node login.mjs')
+      } catch (e) {
+        add('!', 'cookie', `无法验证（${String(e.message).split('\n')[0]}）；不影响离线功能`)
+      }
+    }
+  }
+
+  console.log('bilisum 安装自检\n')
+  for (const r of rows) console.log(`  ${r.mark}  ${padDisp(r.label, 20)} ${r.detail}`)
+  console.log('')
+  if (blocking === 0) {
+    console.log('结论：可以跑。先试：node bilisum.mjs probe "BV1A9xh6ZEg4"')
+    return
+  }
+  console.log(`结论：有 ${blocking} 项阻断，按上面 ✗ 的提示修完，再跑一次 doctor。`)
+  process.exitCode = 1
+}
+
 // ---------- CLI ----------
 const [cmd, ...rest] = process.argv.slice(2)
 const url = rest.find((a) => !a.startsWith('--'))
@@ -971,7 +1094,9 @@ if (import.meta.main) try {
     }
   }
 
-  if (cmd === 'probe') {
+  if (cmd === 'doctor') {
+    await doctor()
+  } else if (cmd === 'probe') {
     report(await probe(url))
   } else if (cmd === 'subs') {
     report(await subs(url, cookieFile))
@@ -1007,7 +1132,7 @@ if (import.meta.main) try {
     )
     report({ ...r, comments, markdown: dest })
   } else {
-    console.error('用法：node bilisum.mjs <probe|subs|asr|get|comments> <url> [--cookie <file>] [--json] [--full] [--preview] [--comments N] [--no-comments]')
+    console.error('用法：node bilisum.mjs <doctor|probe|subs|asr|get|comments> [url] [--cookie <file>] [--json] [--full] [--preview] [--comments N] [--no-comments]')
     process.exitCode = 2
   }
 } catch (e) {

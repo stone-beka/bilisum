@@ -18,17 +18,55 @@
                                                        对话里的模型读它 → 写《速读稿》
 ```
 
-## 30 秒跑起来
+## 先看效果
+
+[`examples/`](examples/) 里有一份**真实产物**：25 分钟的[菲尔兹奖得主邓煜演讲](https://www.bilibili.com/video/BV1A9xh6ZEg4) → 7.5 KB 中文速读稿。摘一段：
+
+> **30 秒速读**：邓煜用 25 分钟讲了三件事：AI 该被当工具用、数学界该怎么用、以及某大厂最近那批「解了几百个开放问题」的证明到底该怎么看。……他的诉求是三条 "proper use"：思路公开、数据可追溯、发布前尽力验证。
+
+不是模板填空——是模型读完 19556 字转写后写出来的。
+
+## 安装
+
+**Windows**：双击 `一键开始.cmd`。它会检查 Node、装依赖、下模型、跑自检，缺什么就告诉你补什么。
+
+**手动三步**：
 
 ```bash
 git clone https://github.com/stone-beka/bilisum.git && cd bilisum/bilisum
 npm install                       # 只有一个依赖：sherpa-onnx-node（本地 ASR）
-pwsh scripts/fetch-models.ps1     # 下 SenseVoice 模型（约 228MB）+ yt-dlp/ffmpeg
-node bilisum.mjs probe "BV1xxxxxxxxx"       # 先看标题/时长/有无字幕
-node bilisum.mjs get   "https://b23.tv/xxx" # 正式取稿 → cache/<BV>.transcript.md
+pwsh scripts/fetch-models.ps1     # 下 SenseVoice 模型（228MB）+ yt-dlp / ffmpeg
+node bilisum.mjs doctor           # 自检
 ```
 
-Windows 实测；macOS / Linux 理论上可用（`fetch-models.ps1` 是 PowerShell，换平台需自行放好二进制与模型）。
+国内网络最容易卡的三处，脚本已经处理了：
+
+| 问题 | 处理 |
+|---|---|
+| HuggingFace 连不上 | `fetch-models.ps1` 依次试 `hf-mirror.com` 镜像 → 官方 → 代理，都不行才报错，并给出期望的 SHA-256 |
+| 代理该不该走 | 默认读 `HTTPS_PROXY` 环境变量，不写死；而 B 站请求**强制直连**（走代理会 412） |
+| yt-dlp / ffmpeg 从 GitHub Releases 下载 | 由 `fetch-models.ps1` 一并处理，不依赖包管理器 |
+
+macOS / Linux：逻辑一样，但 `fetch-models.ps1` 需要 PowerShell（`pwsh`）；也可按脚本里的 URL + SHA-256 手动放文件。
+
+## 装不上？先跑 `doctor`
+
+```
+$ node bilisum.mjs doctor
+bilisum 安装自检
+
+  ✓  Node 24.18.0         满足 >= 20
+  ✓  yt-dlp               取视频信息与音轨 · scripts\yt-dlp.exe
+  ✓  ffmpeg               音轨解成裸 PCM
+  ✓  SenseVoice 模型       228.2 MB，大小对得上
+  ✓  Silero VAD           1.7 MB，大小对得上
+  ✓  cache 可写
+  ✓  cookie               已登录：xxx
+
+结论：可以跑。先试：node bilisum.mjs probe "BV1A9xh6ZEg4"
+```
+
+每一项失败都直接给修复命令；模型只下了一半会按字节数认出来，不会让你跑到一半才发现。
 
 ## 为什么值得看代码（而不是只有个 README）
 
