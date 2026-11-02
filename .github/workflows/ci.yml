@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bilisum
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # 测试只覆盖纯函数，Sherpa ASR 是函数内按需 require（见 bilisum.mjs 里的 require_），
+      # 所以这里不需要安装 228MB 模型或原生依赖。
+      - name: Syntax check
+        run: |
+          for f in bilisum.mjs research.mjs login.mjs; do
+            [ -f "$f" ] && node --check "$f"
+          done
+
+      - name: Unit tests
+        run: node --test
