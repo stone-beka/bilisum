@@ -1,12 +1,27 @@
 {
-    "private": true,
-    "name": "bilisum",
-    "version": "0.1.0",
-    "type": "module",
-    "scripts": {
-        "test": "node --test"
-    },
-    "dependencies": {
-        "sherpa-onnx-node": "^1.13.8"
-    }
+    "private":  true,
+    "name":  "bilisum",
+    "version":  "0.1.0",
+    "type":  "module",
+    "scripts":  {
+                    "test":  "node --test"
+                },
+    "dependencies":  {
+                         "sherpa-onnx-node":  "^1.13.8"
+                     },
+    "license":  "MIT",
+    "repository":  {
+                       "type":  "git",
+                       "url":  "https://github.com/stone-beka/bilisum.git"
+                   },
+    "engines":  {
+                    "node":  "\u003e=20"
+                },
+    "keywords":  [
+                     "bilibili",
+                     "asr",
+                     "sensevoice",
+                     "transcription",
+                     "llm"
+                 ]
 }
