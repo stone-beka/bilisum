@@ -16,12 +16,18 @@
  *   所以本工具默认不再往 out/ 写转写：转写降级为中间产物，落 cache/<BV>.transcript.md，
  *   供会话里的模型读完写《速读稿》。要单独留一份正式转写，显式加 --full。
  *
+ * 评论（2026-10-15 用户新增要求：速读稿末尾要有「我的看法」+「热门评论分析（10 条左右）」）：
+ *   转写文件头里会**自动带上热门评论块**（默认 40 条），模型写速读稿时就地取材。
+ *   为什么必须写进文件头：模型只读这个文件，写在别处它不一定看得到。
+ *
  * 用法：
- *   node bilisum.mjs probe   <url> [--cookie <file>]   # 只看标题/时长/有无字幕
- *   node bilisum.mjs subs    <url> --cookie <file>     # 只要官方字幕
- *   node bilisum.mjs asr     <url>                     # 只要本地识别
- *   node bilisum.mjs get     <url> [--cookie <file>]    # 字幕优先，失败落 ASR（日常用这个）
+ *   node bilisum.mjs probe    <url> [--cookie <file>]   # 只看标题/时长/有无字幕（不取评论）
+ *   node bilisum.mjs subs     <url> --cookie <file>     # 只要官方字幕
+ *   node bilisum.mjs asr      <url>                     # 只要本地识别
+ *   node bilisum.mjs get      <url> [--cookie <file>]   # 字幕优先，失败落 ASR（日常用这个）
+ *   node bilisum.mjs comments <url> [--top 40]          # 只看热门评论
  *   # 默认：转写落 cache/，只在终端打摘要；--full 写正式转写到 out/，--preview 打开头三段
+ *   # --top N 限制评论条数；--no-comments 取转写时不抓评论
  */
 
 import { spawn, spawnSync } from 'node:child_process'
@@ -211,9 +217,10 @@ function currentCookieHeader() {
 /**
  * 调 B 站 web 接口。注意：**必须直连**——Node 的 fetch(undici) 默认不读
  * HTTP_PROXY 环境变量，所以这里是直连，正好符合 B 站的要求。
+ * cookieOverride 只在极少数场景用（显式传 cookie 头），一般留空走 cookies.txt。
  */
-async function biliApi(path) {
-  const ck = currentCookieHeader()
+async function biliApi(path, cookieOverride = null) {
+  const ck = cookieOverride ?? currentCookieHeader()
   const res = await fetch(`https://api.bilibili.com${path}`, {
     headers: { 'User-Agent': UA, Referer: 'https://www.bilibili.com/', ...(ck ? { Cookie: ck } : {}) },
   })
@@ -378,6 +385,160 @@ function metaBlock(meta) {
   if (desc) rows.push(['简介', desc.length > 120 ? `${desc.slice(0, 120)}…` : desc])
   if (meta.argueMsg) rows.push(['官方提示', meta.argueMsg])
   return rows
+}
+
+// ---------- 热门评论（2026-10-15 新增：速读稿要带评论分析）----------
+/**
+ * 2026-10-15 用户要求：速读稿末尾要有「热门评论分析（约 10 条）」+「我的看法」。
+ *
+ * 接口选择是实测逼出来的，别乱换：
+ *  - `/x/v2/reply?type=1&oid=<aid>&sort=2&nohot=0&ps=20&pn=N`
+ *    → **默认排序（B 站自己的"热门评论"口径）**，可翻页。**必须带 `sort`**：
+ *      不带 sort 时接口返回 `code=0` 但 `replies` 为空且 `page.count=0`（静默骗人）。
+ *  - 匿名（无 cookie）时**只给前 3 条热评**，pn≥2 直接空返回；
+ *    有登录 cookie 才能翻页（实测一页 20 条，翻 4 页 80 条正常）。
+ *    → 所以拿不到时**降级**：只用这 3 条，并在速读稿里说明"只取到 3 条"。
+ *  - `comment_count` 用 `page.count`（和 stat.reply 同源，可互校）。
+ *  - 子评论（楼中楼）走 `/x/v2/reply/reply?root=<rpid>&ps=10`，拿前 3 条带赞的。
+ *  - 官方置顶评论在 `top_replies[]` 里，合并时按 rpid 去重。
+ *
+ * 头像、表情图片这些字段一律不取：转写文件是要喂给模型的，越短越省 token。
+ */
+const COMMENT_UA = UA
+
+/** 一条评论 → 精简对象（原文 + 热度 + 地域 + 置顶/UP 标记）。 */
+function pickComment(c, { pinned = false, isUp = false } = {}) {
+  const msg = String(c?.content?.message ?? '').trim()
+  if (!msg) return null
+  return {
+    rpid: String(c?.rpid_str ?? c?.rpid ?? ''),
+    user: String(c?.member?.uname ?? '未知'),
+    like: Number.isFinite(c?.like) ? c.like : 0,
+    replies: Number.isFinite(c?.rcount) ? c.rcount : 0,
+    time: Number.isFinite(c?.ctime) ? fmtDate(c.ctime) : null,
+    location: String(c?.reply_control?.location ?? '').trim(),
+    pinned,
+    isUp,
+    content: msg,
+  }
+}
+
+/**
+ * 抓热门评论。任何失败都只降级（返回 null 或 locale 空），不拖垮转写。
+ * @param {string} bvid
+ * @param {{aid?: number|null, cookieHeader?: string|null, top?: number}} opts
+ */
+async function fetchComments(bvid, { aid = null, cookieHeader = null, top = 40, pages = 3 } = {}) {
+  bvid = bareBvid(bvid) ?? bvid
+  if (!bvid) return null
+  let oid = aid
+  let count = null
+  try {
+    const view = await withRetry('comments/view', () => biliApi(`/x/web-interface/view?bvid=${encodeURIComponent(bvid)}`), { attempts: 2 })
+    oid = view?.aid ?? oid
+    count = Number.isFinite(view?.stat?.reply) ? view.stat.reply : null
+  } catch { /* 拿不到 aid 就用调用方传进来的 */ }
+  if (!oid) return null
+
+  const seen = new Set()
+  const picked = []
+  const add = (c, opts) => {
+    const p = pickComment(c, opts)
+    if (!p || seen.has(p.rpid)) return
+    seen.add(p.rpid)
+    picked.push(p)
+  }
+
+  let method = 'hot'
+  let limited = false
+  let total = count ?? 0
+
+  for (let pn = 1; pn <= pages && picked.length < top; pn++) {
+    let data
+    try {
+      data = await withRetry(`comments/p${pn}`, () => biliApi(`/x/v2/reply?type=1&oid=${oid}&sort=2&nohot=0&ps=20&pn=${pn}`, cookieHeader), { attempts: 2 })
+    } catch (e) {
+      process.stderr.write(`[comments] 第 ${pn} 页失败：${String(e.message).split('\n')[0]}\n`)
+      break
+    }
+    if (Number.isFinite(data?.page?.count) && data.page.count > 0) total = data.page.count
+    // 第一页顺带收置顶评论（官方置顶 + UP 主置顶）
+    if (pn === 1) {
+      for (const c of data?.top_replies ?? []) add(c, { pinned: true })
+      if (data?.upper?.top) add(data.upper.top, { pinned: true, isUp: true })
+      if (data?.top && !Array.isArray(data.top)) add(data.top, { pinned: true, isUp: true })
+    }
+    const list = Array.isArray(data?.replies) ? data.replies : []
+    if (!list.length) {
+      // 有评论数却返回空列表 → 大概率是匿名态翻页被拦，记下来给用户交代清楚
+      if (total > 0 && pn > 1) limited = true
+      break
+    }
+    for (const c of list) add(c, { isUp: Boolean(c?.member?.mid && c.member.mid === data?.upper?.mid) })
+    if (list.length < 20) break
+  }
+
+  // 置顶永远排最前，其余按赞数从高到低（"热门评论"的一致口径）。
+  // 注意：接口的 pn 顺序不是纯按赞数（实测第 1 页里混着 7 赞的），所以显式排一次。
+  picked.sort((a, b) => (b.pinned - a.pinned) || (b.like - a.like))
+  const out = picked.slice(0, top)
+
+  // 楼层里的高赞子评论：只对最终要展示的条目做，别把小接口打爆。
+  // 不设赞数门槛——小视频里"热评"往往只有个位数赞，设门槛就一条楼中楼都拿不到；
+  // 这里最多也就 8 次请求（只取 toMarkdown/report 真正要展示的前 N 条）。
+  const targets = out.filter((c) => c.replies > 0).slice(0, 8)
+  for (const t of targets) {
+    try {
+      const d = await biliApi(`/x/v2/reply/reply?type=1&oid=${oid}&root=${t.rpid}&ps=10&pn=1`, cookieHeader)
+      const subs = (Array.isArray(d?.replies) ? d.replies : [])
+        .map((c) => pickComment(c))
+        .filter(Boolean)
+        .sort((a, b) => b.like - a.like)
+        .slice(0, 3)
+      if (subs.length) t.topReplies = subs
+    } catch { /* 楼中楼拿不到就算了 */ }
+    await new Promise((r) => setTimeout(r, 250))
+  }
+
+  const totalCount = Number.isFinite(total) ? total : 0
+  return {
+    total: totalCount,
+    fetched: out.length,
+    requested: top,
+    // 取到的条数明显少于请求数、且这视频确实有评论 → 说清楚"只取到热门前几条"
+    partial: totalCount > 0 && out.length < top,
+    limited,
+    hasCookie: Boolean(cookieHeader),
+    method,
+    list: out,
+  }
+}
+
+/** 热门评论块 → Markdown 行。写进转写文件头，模型写速读稿时直接读这块。 */
+function commentsMarkdown(cmt) {
+  if (!cmt) return null
+  const lines = ['## 热门评论', '']
+  if (!cmt.total && !cmt.fetched) {
+    return [...lines, '（该视频暂无评论，或评论接口没取到——写速读稿时照实说明，不要编。）', ''].join('\n')
+  }
+  const head = `共 ${cmt.total} 条评论，这里取了 ${cmt.fetched} 条（按 B 站默认"热门"排序${cmt.partial ? '，只取到热门前几条' : ''}）`
+  lines.push(head)
+  if (cmt.limited && !cmt.hasCookie) {
+    lines.push('', '⚠️ 本次为**未登录**状态，B 站只放前 3 条热评、翻页被拦——速读稿里要说明"评论只取到前 3 条"。')
+  }
+  lines.push('')
+  cmt.list.forEach((c, i) => {
+    const tags = [c.pinned ? '置顶' : null, c.isUp ? 'UP主' : null].filter(Boolean)
+    // 评论正文里的换行会把 Markdown 列表打断（实测），压成一行
+    const body = c.content.replace(/\s*\n+\s*/g, ' ').trim()
+    lines.push(`${i + 1}. **${c.user}**（${c.like} 赞 · ${c.replies} 回复${c.location ? ` · ${c.location}` : ''}${c.time ? ` · ${c.time}` : ''}${tags.length ? ` · ${tags.join('/')}` : ''}）：${body}`)
+    for (const s of c.topReplies ?? []) {
+      lines.push(`   - ↳ **${s.user}**（${s.like} 赞${s.location ? ` · ${s.location}` : ''}）：${s.content.replace(/\s*\n+\s*/g, ' ').trim()}`)
+    }
+  })
+  lines.push('')
+  lines.push('> 注：评论是网友观点，不是事实；写速读稿时只做归纳与热度分析，**不要替评论背书写结论**。', '')
+  return lines.join('\n')
 }
 
 /**
@@ -621,11 +782,16 @@ export function planCuts(pcm, { rate = RATE, windowSec = WINDOW_SEC, snapSec = S
 }
 
 // ---------- 本地识别 ----------
-async function transcribe(url) {
+/**
+ * @param {object|null} comments 已抓好的热门评论（可选）。传进来就写进转写文件头，
+ *   模型写速读稿时能就地读到「我的看法 / 热门评论分析」两节要用的素材。
+ *   单独在 `get` 里抓（不在 probe 里抓），因为 probe 要保持秒级、不额外打接口。
+ */
+async function transcribe(url, comments = null, info = null) {
   if (!existsSync(MODEL) || !existsSync(TOKENS)) {
     throw new Error(`模型缺失。期望：\n  ${MODEL}\n  ${TOKENS}\n先跑 scripts/fetch-models.ps1`)
   }
-  const info = await probe(url)
+  info = info ?? await probe(url)
   process.stderr.write(`[1/4] 探测完成：${info.title}（${info.duration ?? '?'} s）\n`)
   const audio = await fetchAudio(url, info)
   process.stderr.write(`[2/4] 音轨已下载：${audio}\n`)
@@ -669,7 +835,7 @@ async function transcribe(url) {
 }
 
 // ---------- 输出 ----------
-function toMarkdown(info, segments, { intermediate = false } = {}) {
+export function toMarkdown(info, segments, { intermediate = false, comments = null } = {}) {
   const total = segments.length ? segments[segments.length - 1].end : (info.duration ?? 0)
   const hhmm = (s) => {
     const t = Math.max(0, Math.round(s))
@@ -698,14 +864,23 @@ function toMarkdown(info, segments, { intermediate = false } = {}) {
     `- 转写来源：${info.mode === 'subs' ? `B 站字幕（${info.lang ?? '?'}）` : '本地 SenseVoice'}`,
     intermediate ? '- 用途：中间产物（喂给模型做速读），**非交付物**' : null,
     '',
-    '## 完整转写（带时间）',
-    '',
-    ...segments.map((s) => `<a href="${link(s.start)}">[${hhmm(s.start)}]</a> ${s.text}`),
-    '',
   ].filter((x) => x !== null)
+  // 热门评论块插在转写正文之前：模型写速读稿时「我的看法 + 热门评论分析」两节就靠它。
+  const cmtBlock = commentsMarkdown(comments)
+  if (cmtBlock) lines.push(cmtBlock)
+  // 时间轴写法分两种（2026-11-02）：**喂给模型的那份不带链接**。
+  // 实测（BV1QSxT6GE1p）：时间轴 25,761 字符里 19,159 是 `<a href="...?t=">` 标签（74%），
+  // 而模型要的只有"第几秒 + 说了什么"——链接是给人点的，模型读了纯属烧 token。
+  // 去掉标签后同一支片从 25.7k 字符降到 6.6k，输入大约砍一半。
+  // 人看的正式转写（`--full` → intermediate:false）仍保留可点击时间戳，一个字不动。
+  lines.push('## 完整转写（带时间）', '',
+    ...segments.map((s) => (intermediate
+      ? `[${hhmm(s.start)}] ${s.text}`
+      : `<a href="${link(s.start)}">[${hhmm(s.start)}]</a> ${s.text}`)),
+    '',
+  )
   return lines.join('\n')
 }
-
 // ---------- CLI ----------
 const [cmd, ...rest] = process.argv.slice(2)
 const url = rest.find((a) => !a.startsWith('--'))
@@ -713,6 +888,13 @@ const ci = rest.indexOf('--cookie')
 const wantJson = rest.includes('--json')
 const wantFull = rest.includes('--full')       // 把转写写成正式文件（进 out/）；默认不写
 const wantPreview = rest.includes('--preview') // 在终端打开头三段；默认不打
+// 评论：默认抓 40 条写进转写文件头（2026-10-15 用户要求速读稿带热门评论分析）。
+// --comments 4 / --top 4 可调条数；--no-comments 关掉（想要秒级出结果时用）。
+const wantNoComments = rest.includes('--no-comments')
+const ciTop = rest.findIndex((a) => a === '--comments' || a === '--top')
+const commentTop = ciTop >= 0 && Number.isFinite(Number(rest[ciTop + 1])) && Number(rest[ciTop + 1]) > 0
+  ? Math.min(100, Number(rest[ciTop + 1]))
+  : 40
 // 没显式给 --cookie 时，自动用 scripts/set-cookie.mjs 存下来的那份。
 // 否则会出现"明明配好了 cookie，subs 却还说自己没 cookie"的荒唐情况。
 const DEFAULT_COOKIE = join(CACHE, 'cookies.txt')
@@ -740,6 +922,10 @@ function report(result) {
   }
   console.log(`来源   ${result.mode === 'subs' ? `B 站官方字幕（${result.langDoc ?? result.lang ?? '?'}）` : result.mode === 'asr' ? '本地 SenseVoice 识别' : '仅探测（未取转写）'}`)
   console.log(`结果   ${segs.length} 段 / ${chars} 字 / 覆盖到 ${hhmmss(last)}`)
+  if (result.comments) {
+    const c = result.comments
+    console.log(`评论   共 ${c.total} 条，已取 ${c.fetched} 条${c.partial ? '（只取到热门前几条）' : ''}${c.hasCookie ? '' : '（未登录仅前 3 条）'}`)
+  }
   if (result.reason) console.log(`原因   ${result.reason}`)
   if (result.markdown) console.log(`文件   ${result.markdown}`)
   if (wantPreview && segs.length) {
@@ -749,35 +935,79 @@ function report(result) {
   }
 }
 
+/** comments 子命令：把热门评论直接打到终端（和数据源同一份口径）。 */
+function reportComments(cmt) {
+  if (wantJson) { console.log(JSON.stringify(cmt, null, 2)); return }
+  if (!cmt) { console.log('评论   数据未取到'); return }
+  console.log(`评论   共 ${cmt.total} 条，已取 ${cmt.fetched} 条${cmt.partial ? '（只取到热门前几条）' : ''}${cmt.hasCookie ? '' : '（未登录仅前 3 条）'}`)
+  cmt.list.forEach((c, i) => {
+    const tags = [c.pinned ? '置顶' : null, c.isUp ? 'UP主' : null].filter(Boolean)
+    console.log(`${String(i + 1).padStart(3)}. ${c.user}（${c.like} 赞 · ${c.replies} 回复${c.location ? ` · ${c.location}` : ''}${tags.length ? ` · ${tags.join('/')}` : ''}）`)
+    console.log(`     ${c.content.replace(/\n/g, ' ')}`)
+    for (const s of c.topReplies ?? []) console.log(`       ↳ ${s.user}（${s.like} 赞）：${s.content.replace(/\n/g, ' ')}`)
+  })
+}
+
 /**
  * 只有「直接运行」时才走 CLI。被 `import`（单元测试）时什么都不做——
  * 否则会打出用法、还把 process.exitCode 改成 2，让测试拿到假的失败退出码。
  */
 if (import.meta.main) try {
+  /**
+   * 抓热门评论（失败只降级）。放在 probe 之后单独调：
+   * probe 要保持秒级且不额外打接口，评论只在真正要出转写/速读时才抓。
+   */
+  const grabComments = async (info) => {
+    if (wantNoComments) return null
+    try {
+      return await fetchComments(info.bvid, {
+        aid: info.meta?.aid ?? null,
+        cookieHeader: currentCookieHeader(),
+        top: commentTop,
+      })
+    } catch (e) {
+      process.stderr.write(`[comments] 取评论失败（速读稿将缺评论分析）：${String(e.message).split('\n')[0]}\n`)
+      return null
+    }
+  }
+
   if (cmd === 'probe') {
     report(await probe(url))
   } else if (cmd === 'subs') {
     report(await subs(url, cookieFile))
+  } else if (cmd === 'comments') {
+    const info = await probe(url)
+    reportComments(await grabComments(info))
   } else if (cmd === 'asr') {
-    report(await transcribe(url))
+    const info = await probe(url)
+    const comments = await grabComments(info)
+    const r = await transcribe(url, comments, info)
+    if (wantFull) {
+      const dest = join(OUT, `${r.bvid ?? 'video'}.md`)
+      writeFileSync(dest, toMarkdown(r, r.segments, { intermediate: false, comments }), 'utf8')
+      r.markdown = dest
+    }
+    report({ ...r, comments })
   } else if (cmd === 'get') {
+    const info = await probe(url)
+    const comments = await grabComments(info)
     let r = await subs(url, cookieFile)
     if (!r.segments.length) {
       process.stderr.write(`字幕不可用（${r.reason}），转本地识别…\n`)
-      r = await transcribe(url)
+      r = await transcribe(url, null, info)
     }
     const name = r.bvid ?? 'video'
-    // 默认产出策略（2026-10-13 起）：唯一交付物是《速读稿》（30 秒速读 + 重点提炼），
+    // 默认产出策略（2026-10-13 起）：唯一交付物是《速读稿》，
     // 由会话里的模型读转写后写进 out/。转写只是喂给模型的中间产物，默认落 cache/，
     // 不写 out/、不进交付。要单独留一份正式转写时加 --full。
     const dest = wantFull ? join(OUT, `${name}.md`) : join(CACHE, `${name}.transcript.md`)
-    writeFileSync(dest, toMarkdown(r, r.segments, { intermediate: !wantFull }), 'utf8')
+    writeFileSync(dest, toMarkdown(r, r.segments, { intermediate: !wantFull, comments }), 'utf8')
     process.stderr.write(
       wantFull ? `已写出：${dest}\n` : `已写出中间产物：${dest}（要正式转写加 --full）\n`,
     )
-    report({ ...r, markdown: dest })
+    report({ ...r, comments, markdown: dest })
   } else {
-    console.error('用法：node bilisum.mjs <probe|subs|asr|get> <url> [--cookie <file>] [--json] [--full] [--preview]')
+    console.error('用法：node bilisum.mjs <probe|subs|asr|get|comments> <url> [--cookie <file>] [--json] [--full] [--preview] [--comments N] [--no-comments]')
     process.exitCode = 2
   }
 } catch (e) {
