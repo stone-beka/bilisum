@@ -1,5 +1,7 @@
 # bilisum —— 贴一条 B 站链接，出一份速读稿
 
+[![ci](https://github.com/stone-beka/bilisum/actions/workflows/ci.yml/badge.svg)](https://github.com/stone-beka/bilisum/actions/workflows/ci.yml)
+
 > 不用装插件，不用开会员，不用把视频看完。给它一个 BV 号 / 链接 / `b23.tv` 短链，它把视频变成一份带时间点的中文速读稿。
 
 **它解决什么**：一条 25 分钟的演讲、一期 40 分钟的杂谈，你只想知道它讲了什么、值不值得看。现在你要么看完，要么看 UP 主自己剪的推广片段。bilisum 走第三条路——**把音轨转录成文，再让模型读文本写速读稿**。
@@ -44,6 +46,21 @@ Windows 实测；macOS / Linux 理论上可用（`fetch-models.ps1` 是 PowerShe
 转写文件是**中间产物**（`cache/<BV>.transcript.md`），头部自动带：视频基本信息（作者/粉丝数/发布/播放/点赞/投币/收藏/评论/弹幕/时长）、热门评论（默认 40 条）、逐句时间轴。模型读它，产出《速读稿》。
 
 时间轴是纯数字 `[00:01:43]`，不带可点击链接——因为给模型读的版本要省 token；`--full` 会另写一份给人看的。
+
+## 方向研究（`research.mjs`）
+
+单条视频用 `bilisum.mjs get`；**给的是一个方向而不是一条链接**时用 `research.mjs`，它分两阶段，中间强制停下来让人确认：
+
+```bash
+node research.mjs "最近显卡价格" --kind price --recon --keywords "显卡 降价|显卡 涨价" --json
+node research.mjs "最近显卡价格" --kind price --ups "mid1,mid2" --pick 3 --json
+```
+
+第一阶段只做**信源侦察**：按垂直度、近 90 天更新节奏、粉丝与中位播放是否合理，算出 A 档专业源 / B 档相关权威源，并给出被挡掉的原因。**谁来当信源是人的决定，不是工具的**，所以这里必须停。
+
+第二阶段只从确认过的 UP 主页里按方向+时效筛片、取逐字稿、按触发词抽帧。
+
+这个设计解决的问题是：AI 自动搜「谁在讲这个话题」时，永远会推给你播放最高的那个——而播放最高往往不是最专业的。
 
 ## 隐私与红线
 
